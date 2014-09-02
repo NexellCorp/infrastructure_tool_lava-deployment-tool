@@ -1,0 +1,2749 @@
+#!/bin/bash
+LAVA_DEPLOYMENT_TOOL_VERSION="0.7"
+
+# Global Configuration
+
+# Where all LAVA stuff is kept, this is meant to make /srv/lava extensible in the future
+LAVA_ROOT=/srv/lava
+
+# All LAVA instances are created relative to this path
+LAVA_PREFIX=$LAVA_ROOT/instances
+
+# Deploy revisions of this branch
+LAVA_MANIFEST_REPOSITORY="${LAVA_MANIFEST_REPOSITORY-http://git.linaro.org/git/lava/lava-manifest.git}"
+LAVA_MANIFEST_HEAD="${LAVA_MANIFEST_HEAD-master}"
+
+# Where to cache the eggs, branches and downloads for buildbot
+LAVA_EGG_CACHE=$LAVA_ROOT/.cache/eggs
+LAVA_DOWNLOAD_CACHE=$LAVA_ROOT/.cache/download-cache
+LAVA_GIT_CACHE=$LAVA_ROOT/.cache/git-cache
+
+# All LAVA uses this python version
+LAVA_PYTHON=python2.6
+
+# All of LAVA is being served by this uWSGI version
+LAVA_UWSGI=1.9.17.1
+LAVA_UWSGI_SHA256=e2558b918afe47640e3c4e75be4347e7e8dc7b19caf2120b6e1fb6bf17891c2a
+
+# Current version of setup required by lava (global state)
+export LAVA_SETUP_REQUIRED_VERSION=30
+# Current required version of instance config
+REQUIRED_LAVA_CONFIG_VERSION=7
+
+# Current required version of worker config
+REQUIRED_LAVA_WORKER_CONFIG_VERSION=0
+
+# Check if this installation is supported
+export LAVA_SUPPORTED=0
+
+# Installation and configuration steps (all the wizard_xxx install_xxx upgrade_xxx functions)
+LAVA_INSTALL_STEPS="devmode user fs buildout database web_hosting app config_app docs"
+LAVA_WORKER_STEPS="get_master devmode user fs buildout remote_database web_hosting app config_app remote_fs coordinator worker_config"
+
+# Will cause Django to be run with DEBUG enabled.
+LAVA_DEV_MODE=no
+
+# If set to yes no questions will be asked and default values will be used
+LAVA_NON_INTERACTIVE=no
+LAVA_DB_CUSTOMPWD=no
+
+# force destructive actions, specially in non-interactive mode
+LAVA_FORCE=no
+
+os_check() {
+    case `lsb_release -i -s` in
+        Ubuntu)
+            case `lsb_release -c -s` in
+                lucid)
+                    export LAVA_PYTHON=python2.6
+                    # FIXME: Lucid is not supported
+                    export LAVA_SUPPORTED=0
+                    # Required system packages
+                    LAVA_PKG_LIST="whiptail python-virtualenv python-pip git-core build-essential $LAVA_PYTHON-dev libxml2-dev apache2 apache2-dev postgresql mercurial conmux linaro-image-tools sshfs liblzma-dev pkg-config"
+                    ;;
+                oneiric|precise)
+                    export LAVA_PYTHON=python2.7
+                    export LAVA_SUPPORTED=1
+                    LAVA_WORKER_LIST="apache2 apache2-dev whiptail python-virtualenv python-pip git build-essential $LAVA_PYTHON-dev libxml2-dev mercurial conmux linaro-image-tools unzip bzr sshfs postgresql-client postgresql-common libpq-dev ser2net ntp liblzma-dev pkg-config"
+                    LAVA_SERVER_ADD="postgresql lava-coordinator python-sphinx python-versiontools"
+                    ;;
+                quantal|raring)
+                    #apache2-dev is no longer available. use apache2-threaded-dev instead.
+                    #see http://changelogs.ubuntu.com/changelogs/pool/main/a/apache2/apache2_2.2.22-6ubuntu2/changelog
+                    export LAVA_PYTHON=python2.7
+                    export LAVA_SUPPORTED=1
+                    LAVA_WORKER_LIST="apache2 apache2-threaded-dev whiptail python-virtualenv python-pip git build-essential $LAVA_PYTHON-dev libxml2-dev mercurial conmux linaro-image-tools unzip bzr sshfs postgresql-client postgresql-common libpq-dev ser2net ntp liblzma-dev pkg-config"
+                    LAVA_SERVER_ADD="postgresql lava-coordinator python-sphinx python-versiontools"
+                    ;;
+                saucy)
+                    export LAVA_PYTHON=python2.7
+                    export LAVA_SUPPORTED=1
+                    LAVA_WORKER_LIST="apache2 apache2-dev libapache2-mod-uwsgi whiptail python-virtualenv python-pip python-pyrex git build-essential $LAVA_PYTHON-dev libxml2-dev mercurial conmux linaro-image-tools unzip bzr sshfs postgresql-client postgresql-common libpq-dev ser2net ntp liblzma-dev pkg-config"
+                    LAVA_SERVER_ADD="postgresql lava-coordinator python-sphinx python-versiontools"
+                    ;;
+            esac
+            ;;
+    esac
+    # drop lava-coordinator, postgresql & apache from worker installs.
+    if [ "$LAVA_INSTALL_STEPS" = "$LAVA_WORKER_STEPS" ]; then
+        LAVA_PKG_LIST=$LAVA_WORKER_LIST
+    else
+        LAVA_PKG_LIST="$LAVA_WORKER_LIST $LAVA_SERVER_ADD"
+    fi
+}
+
+
+uid_check() {
+    if [ "y${SKIP_ROOT_CHECK}" = "yyes" ] ; then
+        echo "skipping uid_check for root"
+    elif [ $(id -u) = 0 ]; then
+        echo "Running as root is not supported"
+        exit 1
+    fi
+}
+
+_read_input() {
+    prompt="$1"
+    varname="$2"
+    default_value="$3"
+    if [ "$LAVA_NON_INTERACTIVE" = yes ]; then
+        if [ -n "$default_value" ]; then
+            eval "$varname='$default_value'"
+        fi
+    else
+        local _response
+        read -p "$prompt" _response
+        if [ -z "$_response" -a -n "$default_value" ]; then
+            eval "$varname='$default_value'"
+        else
+            eval "$varname='$_response'"
+        fi
+    fi
+}
+
+
+evolve_config_0_1() {
+    LAVA_CONFIG_VERSION=1
+}
+
+evolve_config_1_2() {
+    LAVA_CONFIG_VERSION=2
+    LAVA_INSTANCE_OWNS_USER=yes
+}
+
+evolve_config_2_3() {
+    # NOTE version 2->3 evolution was the introduction of the remote "worker"
+    # concept. The main thing here was the new dependency of the master node
+    # to allow for sshfs mounts from workers
+
+    while true; do
+        echo "This version of LAVA no longer requires celery and rabbitmq. If"
+        echo "this is the only instance on this system its safe to uninstall"
+        echo "uninstall these components. Leaving them installed is harmless."
+        _read_input "Uninstall rabbit? (yes|no) [yes]: " RESPONSE yes
+        case "$RESPONSE" in
+            yes|no)
+                break
+                ;;
+        esac
+    done
+    if [ "$RESPONSE" = "yes" ]; then
+        sudo apt-get remove rabbitmq-server
+        sudo rm -f /etc/init/lava-instance-celery*
+    fi
+
+    _ssh_install
+    LAVA_CONFIG_VERSION=3
+}
+
+evolve_config_3_4() {
+    # Before version 3, LAVA_DB_PORT did not exist and the instance
+    # always connected to the default port.
+    LAVA_DB_PORT=
+    LAVA_CONFIG_VERSION=4
+}
+
+evolve_config_4_5() {
+    # Version 5 instances have versiontools installed in the bootstrap-venv
+    local venv="$LAVA_PREFIX/$LAVA_INSTANCE/var/lib/bootstrap-venv"
+    "${venv}/bin/pip" install \
+        $LAVA_DOWNLOAD_CACHE/dist/versiontools-1.9.1.tar.gz
+    LAVA_CONFIG_VERSION=5
+}
+
+evolve_config_5_6() {
+    # version 6 deploys from git using LAVA_MANIFEST_REPOSITORY instead of
+    # LAVA_MANIFEST_BRANCH
+    if [ -n "$LAVA_MANIFEST_BRANCH" ]; then
+        if [ "$LAVA_MANIFEST_BRANCH" != 'lp:lava-manifest' ]; then
+            echo "ERROR: You have a custom LAVA_MANIFEST_BRANCH configuration in instance.conf"
+            echo "       You need to manually change it to point to a git repository now."
+            echo
+            echo "In $LAVA_PREFIX/$LAVA_INSTANCE/instance.conf, replace"
+            echo "  LAVA_MANIFEST_BRANCH=$LAVA_MANIFEST_BRANCH"
+            echo "with"
+            echo "  LAVA_MANIFEST_REPOSITORY=/url/to/git/repository"
+            echo "  LAVA_MANIFEST_BRANCH=master"
+            exit 1
+        fi
+    fi
+    LAVA_CONFIG_VERSION=6
+}
+
+evolve_config_6_7() {
+    if [ ${LAVA_MANIFEST_REPOSITORY} = "http://git.linaro.org/git-ro/lava/lava-manifest.git" ]
+    then
+        if [ "$LAVA_NON_INTERACTIVE" = yes ]; then
+            LAVA_MANIFEST_REPOSITORY="http://git.linaro.org/git/lava/lava-manifest.git"
+            _save_config
+        else
+            echo "ERROR: You have an old LAVA_MANIFEST_REPOSITORY configuration in"
+            echo "       $LAVA_PREFIX/$LAVA_INSTANCE/etc/lava-server/instance.conf"
+            echo "       LAVA has migrated the git repository and you need to manually change it to"
+            echo "       point to http://git.linaro.org/git/lava/lava-manifest.git now"
+            echo
+            echo "In $LAVA_PREFIX/$LAVA_INSTANCE/instance.conf, replace"
+            echo "  LAVA_MANIFEST_REPOSITORY=http://git.linaro.org/git-ro/lava/lava-manifest.git"
+            echo "with"
+            echo "  LAVA_MANIFEST_REPOSITORY=http://git.linaro.org/git/lava/lava-manifest.git"
+            _read_input "Should this be fixed now? (yes/no)? [yes] " LAVA_EVOLVE_MANIFEST yes
+            if [ $LAVA_EVOLVE_MANIFEST = yes ]; then
+                LAVA_MANIFEST_REPOSITORY="http://git.linaro.org/git/lava/lava-manifest.git"
+                _save_config
+            else
+                exit 1
+            fi
+        fi
+    fi
+    LAVA_CONFIG_VERSION=7
+}
+
+_load_configuration() {
+    LAVA_INSTANCE=$1
+
+    # backwards compatible config location
+    if [ -f $LAVA_PREFIX/$LAVA_INSTANCE/instance.conf ]; then
+        . $LAVA_PREFIX/$LAVA_INSTANCE/instance.conf
+        _save_config
+        # TODO: ensure we have all essential variables or we die verbosely
+    # Persistent config
+    elif [ -e $LAVA_PREFIX/$LAVA_INSTANCE/etc/lava-server/instance.conf ]; then
+        . $LAVA_PREFIX/$LAVA_INSTANCE/etc/lava-server/instance.conf
+    else
+        # Legacy configs, no lava- prefix
+        export LAVA_SYS_USER=$LAVA_INSTANCE
+        export LAVA_DB_USER=$LAVA_INSTANCE
+        export LAVA_DB_NAME=$LAVA_INSTANCE
+    fi
+
+    LAVA_CONFIG_VERSION="${LAVA_CONFIG_VERSION-0}"
+    if [ "$LAVA_CONFIG_VERSION" -gt "$REQUIRED_LAVA_CONFIG_VERSION" ]; then
+        die "instance config too new; upgrade lava-deployment-tool"
+    elif [ "$LAVA_CONFIG_VERSION" -lt "$REQUIRED_LAVA_CONFIG_VERSION" ]; then
+        echo "Upgrading config to version $REQUIRED_LAVA_CONFIG_VERSION"
+        while [ "$LAVA_CONFIG_VERSION" -lt "$REQUIRED_LAVA_CONFIG_VERSION" ]; do
+            local old_config_version="$LAVA_CONFIG_VERSION"
+            local evolve_func_name="evolve_config_${LAVA_CONFIG_VERSION}_$((LAVA_CONFIG_VERSION+1))"
+            echo "Running $evolve_func_name"
+            $evolve_func_name
+            if [ "${LAVA_CONFIG_VERSION}" -ne "$((old_config_version+1))" ]; then
+                die "$evolve_func_name failed to advance LAVA_CONFIG_VERSION"
+            fi
+        done
+        _save_config
+    fi
+
+    export LAVA_SYS_USER
+    export LAVA_DB_USER
+    export LAVA_DB_NAME
+}
+
+
+_show_config() {
+    cat <<INSTANCE_CONF
+# Config version
+LAVA_CONFIG_VERSION='$LAVA_CONFIG_VERSION'
+# Installation prefix
+LAVA_PREFIX='$LAVA_PREFIX'
+# Instance name
+LAVA_INSTANCE='$LAVA_INSTANCE'
+# The lava-server repository used by upgrade
+LAVA_MANIFEST_REPOSITORY='$LAVA_MANIFEST_REPOSITORY'
+LAVA_MANIFEST_HEAD='$LAVA_MANIFEST_HEAD'
+LAVA_BUILDOUT_CFG='$LAVA_BUILDOUT_CFG'
+# System configuration (Unix-level)
+LAVA_SYS_USER='$LAVA_SYS_USER'
+LAVA_INSTANCE_OWNS_USER='$LAVA_INSTANCE_OWNS_USER'
+# Apache configuration
+LAVA_APACHE_VHOST='$LAVA_APACHE_VHOST'
+LAVA_DEV_MODE='$LAVA_DEV_MODE'
+# PostgreSQL configuration
+LAVA_DB_NAME='$LAVA_DB_NAME'
+LAVA_DB_USER='$LAVA_DB_USER'
+LAVA_DB_SERVER="$LAVA_DB_SERVER"
+LAVA_DB_PORT='$LAVA_DB_PORT'
+LAVA_DB_PASSWORD='$LAVA_DB_PASSWORD'
+# Scheduler configuration
+LAVA_SCHEDULER_ENABLED='$LAVA_SCHEDULER_ENABLED'
+LAVA_SERVER_IP='$LAVA_SERVER_IP'
+LAVA_PROXY='$LAVA_PROXY'
+INSTANCE_CONF
+}
+
+
+_save_config() {
+    mkdir -p $LAVA_PREFIX/$LAVA_INSTANCE/etc/lava-server/
+    if [ -f $LAVA_PREFIX/$LAVA_INSTANCE/etc/lava-server/default_database.conf ]
+    then
+      . $LAVA_PREFIX/$LAVA_INSTANCE/etc/lava-server/default_database.conf
+    fi
+    if [ -n "$LAVA_MASTER" ]
+    then
+        LAVA_DB_SERVER=$LAVA_MASTER
+    fi
+    _show_config >$LAVA_PREFIX/$LAVA_INSTANCE/etc/lava-server/instance.conf
+    # backwards compatilibity
+    if [ -f $LAVA_PREFIX/$LAVA_INSTANCE/instance.conf ]
+    then
+      rm $LAVA_PREFIX/$LAVA_INSTANCE/instance.conf
+    fi
+    if [ ! -e $LAVA_PREFIX/$LAVA_INSTANCE/instance.conf ]
+    then
+      ln -s $LAVA_PREFIX/$LAVA_INSTANCE/etc/lava-server/instance.conf $LAVA_PREFIX/$LAVA_INSTANCE/instance.conf
+    fi
+}
+
+
+_configure() {
+    set +x
+    export LAVA_INSTANCE="$1"
+    export LAVA_CONFIG_VERSION="$REQUIRED_LAVA_CONFIG_VERSION"
+    # Defaults + Wizard loop
+    while true; do
+        echo "Instance Configuration"
+        echo "----------------------"
+        echo
+        echo "Before configuring your instance we need to ask you a few questions"
+        echo "The defaults are safe so feel free to use them without any changes"
+        # Wizard page loop
+        for install_step in $LAVA_INSTALL_STEPS; do
+            defaults_$install_step
+            while true; do
+                echo
+                echo "Note: it is safe to CTRL-C at this stage!"
+                wizard_$install_step && break
+            done
+        done
+        echo
+        echo "Configuration summary"
+        echo "---------------------"
+        echo
+        _show_config
+        echo
+        # Response loop
+        while true; do
+            echo "(it is safe to CTRL-C at this stage!)"
+            _read_input "Is everything okay? (yes|no) [yes]: " RESPONSE yes
+            case "$RESPONSE" in
+                yes|no)
+                    break
+                    ;;
+            esac
+        done
+        if [ "$RESPONSE" = "yes" ]; then
+            echo "Saving configuration"
+            _save_config
+            echo "Configuration done"
+            break
+        else
+            echo "Going back to wizard"
+            continue
+        fi
+    done
+    set -x
+}
+
+
+_install() {
+    for install_step in $LAVA_INSTALL_STEPS; do
+        echo "Running installation step $install_step"
+        install_$install_step
+    done
+    echo "All installation is done"
+}
+
+defaults_get_master() {
+    true
+}
+
+wizard_get_master() {
+    echo
+    echo "LAVA Master Setup"
+    echo "^^^^^^^^^^^^^^^^^"
+    echo
+    echo "LAVA worker nodes need a master defined to configure the"
+    echo "database and sshfs connections"
+    echo
+    echo "To work with remote nodes, the Master needs to be configured"
+    echo "to allow the database to listen to the workers."
+    echo
+    echo "Ensure that the Master allows remote access from workers"
+    echo "before submitting jobs or health checks."
+    echo
+    echo "If the Master does not already have remote workers, run:"
+    echo "export LAVA_DB_ALLOWREMOTE=yes"
+    echo "./lava-deployment-tool upgrade <INSTANCE>"
+    echo
+    echo "You can continue setting up the worker, as long as"
+    echo "remote database access is enabled before jobs are submitted."
+    echo
+    _read_input "Please enter the address of the master [${LAVA_MASTER}] :" LAVA_MASTER $LAVA_MASTER
+}
+
+install_get_master() {
+    true
+}
+
+defaults_devmode () {
+    # set elsewhere
+    export LAVA_DEV_MODE
+}
+
+wizard_devmode () {
+    echo
+    echo "Developer mode is end of life"
+    echo "^^^^^^^^^^^^^^^^^^^^^^^^^^^^"
+    echo
+    echo "By default lava-deployment-tool creates an instance suited"
+    echo "to a production deployment.  Enabling developer mode changes"
+    echo "a few things:"
+    echo
+    echo "1) Django runs in DEBUG mode"
+    echo "2) LAVA_BUILDOUT_CFG defaults to buildout-development.cfg,"
+    echo "   which installs some development/testing related packages"
+    echo "3) Arranges for the instance to run as the user invoking"
+    echo "   lava-deployment-tool rather than an instance-specific"
+    echo "   system user."
+    echo "4) lava-deployment-tool will disable your exising default"
+    echo "   Apache virtualhost to make it the default one."
+    echo
+    echo "You don't want to use development mode on production servers."
+    echo
+    echo "Developer mode is no longer receiving updates. Development"
+    echo "has moved to packages: "
+    echo "https://staging.validation.linaro.org/static/docs/installation.html"
+    echo
+    echo "Developer mode: $LAVA_DEV_MODE"
+    echo
+    echo "next    - continue"
+    echo "dev     - toggle developer mode"
+
+    _read_input "Please decide what to do [next]: " RESPONSE next
+
+    case "$RESPONSE" in
+        next)
+            return 0  # loop complete
+            ;;
+        dev)
+            if [ $LAVA_DEV_MODE = yes ]; then
+                LAVA_DEV_MODE=no
+            else
+                LAVA_DEV_MODE=yes
+            fi
+            return 1
+            ;;
+    esac
+    return 1  # another loop please
+}
+
+install_devmode() {
+    sudo apt-get install --no-install-recommends diffstat
+}
+
+defaults_user() {
+    if [ $LAVA_DEV_MODE = "yes" ]; then
+        export LAVA_SYS_USER=$(whoami)
+        export LAVA_INSTANCE_OWNS_USER=no
+    else
+        export LAVA_SYS_USER=lava-$LAVA_INSTANCE
+        export LAVA_INSTANCE_OWNS_USER=yes
+    fi
+}
+
+
+wizard_user() {
+    export LAVA_SYS_USER_DESC="User for LAVA instance $LAVA_INSTANCE"
+
+    echo
+    echo "User account configuration"
+    echo "^^^^^^^^^^^^^^^^^^^^^^^^^^"
+    echo
+    echo "We need to create a system user for this instance:"
+    echo "System user account configuration"
+    echo
+    echo "User name:        '$LAVA_SYS_USER'"
+    echo "User description: '$LAVA_SYS_USER_DESC'"
+    echo
+    echo "next   - Use the user name as is"
+    echo "edit   - Edit the user name"
+
+    _read_input "Please please decide what to do [next]: " RESPONSE next
+
+    case "$RESPONSE" in
+        next)
+            return 0  # loop complete
+            ;;
+        edit)
+            _read_input "New user name: " LAVA_SYS_USER_NEW
+            if test -n "$LAVA_SYS_USER_NEW" && echo "$LAVA_SYS_USER_NEW" | grep -q -E -e '[a-z]+[-a-z0-9]*'; then
+                echo "New user name is '$LAVA_SYS_USER_NEW'"
+                LAVA_SYS_USER="$LAVA_SYS_USER_NEW"
+                if [ "$LAVA_SYS_USER" != "$(whoami)"]; then
+                    export LAVA_INSTANCE_OWNS_USER=yes
+                else
+                    export LAVA_INSTANCE_OWNS_USER=no
+                fi
+            else
+                echo "Incorrect user name. It must be a simple ascii identifier"
+            fi
+            ;;
+    esac
+    return 1  # another loop please
+}
+
+
+install_user() {
+    if [ "$LAVA_SYS_USER" != "$(whoami)" ] ; then
+        logger "Creating system user for LAVA instance $LAVA_INSTANCE: $LAVA_SYS_USER"
+        echo "Creating system user for LAVA instance $LAVA_INSTANCE: $LAVA_SYS_USER"
+        # The user created must be a member of the "fuse" group, because the
+        # fuse mount we do includes "-o root_allow" since the dispatcher runs
+        # as root
+        sudo useradd -d $LAVA_PREFIX/$LAVA_INSTANCE/home -G fuse --system --comment "$LAVA_SYS_USER_DESC" "$LAVA_SYS_USER"
+    fi
+}
+
+
+defaults_fs() {
+    true
+}
+
+
+wizard_fs() {
+    echo
+    echo "Filesystem configuration"
+    echo "^^^^^^^^^^^^^^^^^^^^^^^^"
+    echo
+    echo "We need filesystem location for this instance"
+    echo
+    echo "Installation directory: $LAVA_PREFIX/$LAVA_INSTANCE"
+    echo
+    echo "Note: everything apart from the database state will be stored there"
+    echo
+    echo "(this is just a notification, it is not configurable)"
+    echo
+    echo "next    - continue"
+
+    _read_input "Please decide what to do [next]: " RESPONSE next
+
+    case "$RESPONSE" in
+        next)
+            return 0  # loop complete
+    esac
+    return 1  # another loop please
+}
+
+_ssh_install() {
+    sshdir=$(eval echo ~$LAVA_SYS_USER)/.ssh
+    if [ "$LAVA_INSTALL_STEPS" = "$LAVA_WORKER_STEPS" ]
+    then
+        # we are configuring a worker
+        if [ ! -d $sshdir ]
+        then
+            echo "SSH directory (${sshdir}) not found, creating it"
+            sudo mkdir -p $sshdir
+            sudo chown $LAVA_SYS_USER $sshdir
+        fi
+
+        if [ ! -f $sshdir/id_rsa ]
+        then
+            echo "Creating RSA ssh key for user $LAVA_SYS_USER"
+            sudo -u $LAVA_SYS_USER ssh-keygen -C "ssh key used by LAVA for sshfs" -f $sshdir/id_rsa -t rsa -N ""
+        fi
+
+        # - we don't want anything under media since this will get mounted
+        # - but only if not already mounted!
+        if [ ! -f $LAVA_PREFIX/$LAVA_INSTANCE/var/lib/lava-server/media/.mounted ]; then
+            sudo rm -rf $LAVA_PREFIX/$LAVA_INSTANCE/var/lib/lava-server/media/*
+        fi
+    else
+        ### we are configuring a master
+        # Setup the ssh directories in case you want to point workers at this master
+        if [ ! -d $sshdir ]
+        then
+            echo "Creating SSH directory (${sshdir}) as it didn't exist"
+            sudo mkdir -p $sshdir
+            sudo chown -R $LAVA_SYS_USER:$LAVA_SYS_USER $sshdir
+            sudo chmod 700 $sshdir
+        fi
+
+        if [ ! -f $sshdir/authorized_keys ]
+        then
+            echo "Creating an authorized_keys file, as it didn't exist"
+            sudo touch $sshdir/authorized_keys
+            sudo chown $LAVA_SYS_USER:$LAVA_SYS_USER $sshdir/authorized_keys
+            sudo chmod 600 $sshdir/authorized_keys
+        fi
+
+        # this file will allow worker nodes to check if the directory is
+        # properly mounted or not
+        sudo touch $LAVA_PREFIX/$LAVA_INSTANCE/var/lib/lava-server/media/.mounted
+
+        # ensure lava-logs and job-output is group writeable for new sshfs workers
+        sudo chmod g+w $LAVA_PREFIX/$LAVA_INSTANCE/var/lib/lava-server/media/lava-logs
+        sudo chmod g+w $LAVA_PREFIX/$LAVA_INSTANCE/var/lib/lava-server/media/job-output
+    fi
+}
+
+install_fs() {
+    logger "Creating filesystem structure for LAVA instance $LAVA_INSTANCE"
+    # Create basic directory structure
+    # Apache application:
+    mkdir -p $LAVA_PREFIX/$LAVA_INSTANCE/etc/apache2/conf.d
+    # Apache site:
+    mkdir -p $LAVA_PREFIX/$LAVA_INSTANCE/etc/apache2/sites-available
+    # Dispatcher configuration
+    mkdir -p $LAVA_PREFIX/$LAVA_INSTANCE/etc/lava-dispatcher
+    # Dashboard reports
+    mkdir -p $LAVA_PREFIX/$LAVA_INSTANCE/etc/lava-server/reports
+    # Dashboard data views
+    mkdir -p $LAVA_PREFIX/$LAVA_INSTANCE/etc/lava-server/views
+    # Custom templates
+    mkdir -p $LAVA_PREFIX/$LAVA_INSTANCE/etc/lava-server/templates
+    # Static file cache
+    mkdir -p $LAVA_PREFIX/$LAVA_INSTANCE/var/www/lava-server/static
+    # Lava-dispatcher folders
+    mkdir -p $LAVA_PREFIX/$LAVA_INSTANCE/var/cache/lava-dispatcher
+    mkdir -p $LAVA_PREFIX/$LAVA_INSTANCE/var/www/lava-server/images
+
+    if [ "$LAVA_INSTALL_STEPS" = "$LAVA_WORKER_STEPS" ]; then
+        # will be used to mount the remote filesystem
+        mkdir -p $LAVA_PREFIX/$LAVA_INSTANCE/var/lib/lava-server/media
+    else
+        # Repository of precious user-generated data (needs backup) we include
+        # the creation of "lava-logs" as well. Otherwise this gets created
+        # automatically by lava code as root and without g+w permissions
+        mkdir -p $LAVA_PREFIX/$LAVA_INSTANCE/var/lib/lava-server/media/lava-logs
+        # Similar to the above, we need to create the job-output folder so that
+        # it also does not get created by lava as root.
+        mkdir -p $LAVA_PREFIX/$LAVA_INSTANCE/var/lib/lava-server/media/job-output
+    fi
+
+    # Log files
+    mkdir -p $LAVA_PREFIX/$LAVA_INSTANCE/var/log
+    # Sockets and other runtime stuff
+    mkdir -p $LAVA_PREFIX/$LAVA_INSTANCE/run
+    # Temporary files
+    mkdir -p $LAVA_PREFIX/$LAVA_INSTANCE/tmp
+
+    # For buildout
+    mkdir -p $LAVA_PREFIX/$LAVA_INSTANCE/code
+    if [ ! -e $LAVA_PREFIX/$LAVA_INSTANCE/bin ]
+    then
+        ln -s $LAVA_PREFIX/$LAVA_INSTANCE/code/current/bin $LAVA_PREFIX/$LAVA_INSTANCE
+    fi
+
+    # Allow apache (running as www-data) to read our public web files
+    sudo chgrp -R www-data $LAVA_PREFIX/$LAVA_INSTANCE/var/www/lava-server/
+    sudo chmod -R g+rXs $LAVA_PREFIX/$LAVA_INSTANCE/var/www/lava-server/
+    # Allow instance user to read all lava-server settings
+    sudo chgrp -R $LAVA_SYS_USER $LAVA_PREFIX/$LAVA_INSTANCE/etc/lava-server
+    sudo chmod -R g+rXs $LAVA_PREFIX/$LAVA_INSTANCE/etc/lava-server/
+
+    if [ ! -f $LAVA_PREFIX/$LAVA_INSTANCE/var/lib/lava-server/media/.mounted ]; then
+        # Allow instance to write to media directory
+        sudo chgrp -R $LAVA_SYS_USER $LAVA_PREFIX/$LAVA_INSTANCE/var/lib/lava-server/
+        sudo chmod -R g+rwXs $LAVA_PREFIX/$LAVA_INSTANCE/var/lib/lava-server/
+        # Prevent anyone else from reading from the media directory
+        sudo chmod -R o-rX $LAVA_PREFIX/$LAVA_INSTANCE/var/lib/lava-server/
+    fi
+
+    # Allow instance user to put stuff in runtime directory
+    # and allow www-data to read from that directory
+    sudo chown -R $LAVA_SYS_USER:www-data $LAVA_PREFIX/$LAVA_INSTANCE/run
+    sudo chmod -R g+rXs $LAVA_PREFIX/$LAVA_INSTANCE/run
+    # Allow instance to log stuff to log directory
+    # Allow users in the adm group to read those logs
+    sudo chown -R $LAVA_SYS_USER:adm $LAVA_PREFIX/$LAVA_INSTANCE/var/log
+    sudo chmod -R g+rXs $LAVA_PREFIX/$LAVA_INSTANCE/var/log
+    # Allow instance user to put stuff in temporary directory
+    # Set the sticky and setgid bits there
+    sudo chgrp -R $LAVA_SYS_USER $LAVA_PREFIX/$LAVA_INSTANCE/tmp
+    sudo chmod -R g+rwtXs $LAVA_PREFIX/$LAVA_INSTANCE/tmp
+
+    _ssh_install
+}
+
+defaults_remote_fs() {
+    export LAVA_REMOTE_FS_DIR=/srv/lava/instances/${LAVA_INSTANCE}
+    export LAVA_REMOTE_FS_USER=${LAVA_SYS_USER}
+    export LAVA_REMOTE_FS_HOST=${LAVA_MASTER}
+}
+
+
+wizard_remote_fs() {
+    echo
+    echo "Remote filesystem configuration"
+    echo "^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^"
+    echo
+    echo "The remote worker needs write access to the 'media' directory on"
+    echo "the master LAVA node so that dispatcher logs will be visible. This"
+    echo "is managed by configuring sshfs to mount the master's media directory"
+    echo
+
+    LAVA_REMOTE_FS_HOST=${LAVA_REMOTE_FS_HOST:-$LAVA_MASTER}
+    LAVA_REMOTE_FS_USER=${LAVA_REMOTE_FS_USER:-$LAVA_SYS_USER}
+    LAVA_REMOTE_FS_DIR=${LAVA_REMOTE_FS_DIR:-/srv/lava/instances/${LAVA_INSTANCE}}
+
+    echo "Master Instance Host:        '$LAVA_REMOTE_FS_HOST'"
+    echo "Master Instance User:        '$LAVA_REMOTE_FS_USER'"
+    echo "Master Instance Directory:   '$LAVA_REMOTE_FS_DIR'"
+    echo
+    echo "next   - Use the master information as is"
+    echo "edit   - Edit the master information"
+
+    _read_input "Please please decide what to do [next]: " RESPONSE next
+
+    case "$RESPONSE" in
+        next)
+            return 0  # loop complete
+            ;;
+        edit)
+            _read_input "Please enter the master host/IP [${LAVA_DB_SERVER}] :" LAVA_REMOTE_FS_HOST $LAVA_DB_SERVER
+            _read_input "Please enter the master user name [${LAVA_SYS_USER}] : " LAVA_REMOTE_FS_USER $LAVA_DB_USER
+            _read_input "Please enter the master's instance directory [${LAVA_REMOTE_FS_DIR}] : " LAVA_REMOTE_FS_DIR $LAVA_REMOTE_FS_DIR
+            ;;
+    esac
+    return 1  # another loop please
+
+}
+
+
+install_remote_fs() {
+    echo "Configuring remote fileystem access $LAVA_INSTANCE"
+
+    if ! sudo grep ^user_allow_other /etc/fuse.conf >/dev/null ; then
+        logger "Updating /etc/fuse.conf to enable 'allow_root' mounts"
+        sudo sh -c "cat >>/etc/fuse.conf" <<EOF
+# enabled for LAVA: required so root can access sshfs directories
+user_allow_other
+EOF
+    fi
+
+
+    echo "Please add the following public key into your master node's "
+    echo " $LAVA_REMOTE_FS_DIR/home/.ssh/authorized_keys file"
+    echo
+    sshdir=$(eval echo ~$LAVA_SYS_USER)/.ssh
+    echo "-------- WORKER NODE PUBLIC KEY STARTS HERE --------"
+    cat $sshdir/id_rsa.pub
+    echo "-------- WORKER NODE PUBLIC KEY ENDS HERE --------"
+    echo
+
+    _read_input "Type next to continue: " RESPONSE next
+
+    echo "Creating sshfs mount script for this instance"
+    # we use sbin because the bin directory is created by buildout. creating
+    # this script from buildout isn't that great of an option, so...
+    sbindir=$LAVA_PREFIX/$LAVA_INSTANCE/sbin
+    [ -d $sbindir ] || mkdir $sbindir
+    mntscript=$sbindir/mount-masterfs
+    sudo sh -c "cat >$mntscript" <<EOF
+#!/bin/sh
+
+LOCAL_USER=$LAVA_SYS_USER
+LOCAL_DIR=$LAVA_PREFIX/$LAVA_INSTANCE/var/lib/lava-server/media
+
+REMOTE_USER=$LAVA_REMOTE_FS_USER
+REMOTE_HOST=$LAVA_REMOTE_FS_HOST
+REMOTE_DIR=$LAVA_REMOTE_FS_DIR/var/lib/lava-server/media
+
+if [ -f \$LOCAL_DIR/.mounted ] ; then
+    if [ "$1" != "--force" ] ; then
+        exit 0
+    fi
+fi
+
+sudo umount \$LOCAL_DIR
+sudo -u \$LOCAL_USER sshfs -o allow_root -o reconnect \$REMOTE_USER@\$REMOTE_HOST:\$REMOTE_DIR \$LOCAL_DIR
+EOF
+
+    sudo chmod +x $mntscript
+
+    echo "Adding master server to known_hosts"
+    sshdir=$(eval echo ~$LAVA_SYS_USER)/.ssh
+    ssh-keyscan -H $LAVA_REMOTE_FS_HOST | sudo -u $LAVA_SYS_USER tee $sshdir/known_hosts
+}
+
+install_coordinator () {
+    # put the lava-coordinator conf file in place
+    if [ ! -d /etc/lava-coordinator ]; then
+        sudo mkdir /etc/lava-coordinator
+    fi
+    if [ ! -f /etc/lava-coordinator/lava-coordinator.conf ]; then
+        sudo sh -c "cat >/etc/lava-coordinator/lava-coordinator.conf" <<EOF
+{
+    "port": 3079,
+    "blocksize": 4096,
+    "poll_delay": 3,
+    "coordinator_hostname": "$LAVA_MASTER"
+}
+EOF
+    fi
+}
+
+wizard_coordinator () {
+    true
+}
+
+defaults_coordinator () {
+    true
+}
+
+defaults_buildout () {
+    true
+}
+
+wizard_buildout () {
+    true
+}
+
+wizard_docs () {
+    true
+}
+
+upgrade_app () {
+    # install_app is already executed explicitly before the upgrade steps.
+    true
+}
+
+upgrade_docs () {
+    install_docs
+}
+
+upgrade_devmode () {
+    sudo apt-get install --no-install-recommends diffstat
+}
+
+upgrade_user () {
+    true
+}
+
+upgrade_fs () {
+    install_fs
+}
+
+upgrade_buildout () {
+    true
+}
+
+upgrade_database () {
+    # "upgrades" to the database need to be done with south migrations.
+    if [[ $LAVA_DB_ALLOWREMOTE == "yes" ]]
+    then
+      allow_remote_postgres
+    fi
+}
+
+upgrade_web_hosting () {
+    true
+}
+
+upgrade_config_app () {
+    install_config_app
+}
+
+upgrade_get_master () {
+    true
+}
+
+upgrade_remote_database () {
+    install_remote_database
+}
+
+upgrade_remote_fs () {
+    true
+}
+
+upgrade_coordinator () {
+    install_coordinator
+}
+
+upgrade_worker_config () {
+    install_worker_config
+}
+
+install_buildout () {
+    set -xe
+    local venv="$LAVA_PREFIX/$LAVA_INSTANCE/var/lib/bootstrap-venv"
+    virtualenv --no-site-packages "${venv}"
+    "${venv}/bin/pip" install \
+        $LAVA_DOWNLOAD_CACHE/dist/distribute-0.6.24.tar.gz \
+        $LAVA_DOWNLOAD_CACHE/dist/zc.buildout-1.5.2.tar.gz \
+        $LAVA_DOWNLOAD_CACHE/dist/uwsgi-$LAVA_UWSGI.tar.gz \
+        $LAVA_DOWNLOAD_CACHE/dist/bzr-2.5.1.tar.gz \
+        $LAVA_DOWNLOAD_CACHE/dist/versiontools-1.9.1.tar.gz
+    set +xe
+}
+
+defaults_database() {
+    export LAVA_DB_NAME="lava-$LAVA_INSTANCE"
+    export LAVA_DB_USER="lava-$LAVA_INSTANCE"
+    export LAVA_DB_PORT=""
+    if [[ ! -z $LAVA_DB_PASSWORD ]]
+    then
+      export LAVA_DB_PASSWORD
+      LAVA_DB_CUSTOMPWD=yes
+    else
+      export LAVA_DB_PASSWORD=$(dd if=/dev/urandom bs=1 count=128 2>/dev/null | md5sum | cut -d ' ' -f 1)
+    fi
+}
+
+
+wizard_database() {
+    echo
+    echo "PostgreSQL configuration"
+    echo "^^^^^^^^^^^^^^^^^^^^^^^^"
+    echo
+    echo "We will use PostgreSQL to store application state"
+    echo "(apart from files that are just files in your filesystem)"
+    echo "Add details from the instance.conf on the master:"
+    echo
+    echo "Database name (LAVA_DB_NAME): $LAVA_DB_NAME"
+    echo "Database user (LAVA_DB_USER): $LAVA_DB_USER"
+    echo "Database port (LAVA_DB_PORT): $LAVA_DB_PORT"
+    if [[ "$LAVA_DB_CUSTOMPWD" == "yes" ]]
+    then
+      echo "     password: $LAVA_DB_PASSWORD (set by user)"
+    else
+      echo "     password: $LAVA_DB_PASSWORD (automatically generated)"
+    fi
+    echo
+    echo "(this is just a notification, it is not configurable)"
+    echo
+    echo "port    - specify a different port to connect to"
+    echo "next    - continue"
+
+    _read_input "Please decide what to do [next]: " RESPONSE next
+
+    case "$RESPONSE" in
+        next)
+            return 0  # loop complete
+            ;;
+        port)
+           _read_input "New port: " LAVA_DB_PORT_NEW
+            if echo "$LAVA_DB_PORT_NEW" | grep -q -E -e '[a-z0-9]+'; then
+                echo "New port name is '$LAVA_DB_PORT_NEW'"
+                LAVA_DB_PORT="$LAVA_DB_PORT_NEW"
+            else
+                echo "Incorrect port. It must be empty or a decimal integer."
+            fi
+            ;;
+    esac
+    return 1  # another loop please
+}
+
+
+install_database()
+{
+    logger "Creating database configuration for LAVA instance $LAVA_INSTANCE"
+
+    # Create database configuration file
+    cat >$LAVA_PREFIX/$LAVA_INSTANCE/etc/lava-server/default_database.conf <<DEFAULT_DATABASE_CONF
+dbuser='$LAVA_DB_USER'
+dbpass='$LAVA_DB_PASSWORD'
+basepath=''
+dbname='$LAVA_DB_NAME'
+dbserver=''
+dbport='$LAVA_DB_PORT'
+dbtype='pgsql'
+DEFAULT_DATABASE_CONF
+
+    # Create database user, if it doesn't exist
+    if ! sudo -u postgres psql -c "SELECT usename FROM pg_user WHERE usename='$LAVA_DB_USER'" | grep "$LAVA_DB_USER"; then
+        sudo -u postgres createuser \
+            --no-createdb \
+            --encrypted \
+            --login \
+            --no-superuser \
+            --no-createrole \
+            --no-password \
+            --port "$LAVA_DB_PORT" \
+            "$LAVA_DB_USER" \
+            || die "Failed to create database user"
+    fi
+
+    # Set a password for our new user
+    sudo -u postgres psql \
+        --port "$LAVA_DB_PORT" \
+        --quiet \
+        --command="ALTER USER \"$LAVA_DB_USER\" WITH PASSWORD '$LAVA_DB_PASSWORD'" \
+        || die "Failed to set database password"
+
+    # Create a database for our new user, if it doesn't exist
+    if ! sudo -u postgres psql -c "SELECT datname FROM pg_database WHERE datname='$LAVA_DB_NAME'" | grep "$LAVA_DB_NAME"; then
+        sudo -u postgres createdb \
+            --port "$LAVA_DB_PORT" \
+            --locale=en_US.UTF-8 \
+            --encoding=UTF-8 \
+            --owner="$LAVA_DB_USER" \
+            --template=template0 \
+            --no-password \
+            "$LAVA_DB_NAME" \
+            || die "Failed to create a database"
+    fi
+
+    if [[ $LAVA_DB_ALLOWREMOTE == "yes" ]]
+    then
+      allow_remote_postgres
+    fi
+}
+
+allow_remote_postgres() {
+    restart=0
+    echo "Editing the postgres config files to allow remote connections"
+    for pgfile in `find /etc/postgresql -name postgresql.conf`
+    do
+        CHK=`grep "listen_addresses = '\*'" $pgfile 2>/dev/null || true`
+        if [ -z "$CHK" ]
+        then
+            echo "Need to configure listen_addresses in $pgfile"
+            TMPFILE=`mktemp`
+            (cat $pgfile | grep -v listen_addresses; echo "listen_addresses = '*'") > $TMPFILE
+            cat $TMPFILE | sudo tee $pgfile > /dev/null
+            restart=1
+        else
+            echo "$pgfile already modified. Server should be listening."
+        fi
+    done
+    ALLOW="host    all    all    0.0.0.0/0    trust"
+    for hbafile in `find /etc/postgresql -name pg_hba.conf`
+    do
+        CHK=`sudo grep "${ALLOW}" $hbafile 2>/dev/null || true`
+        if [ -z "${CHK}" ]
+        then
+            echo "host    all    all    0.0.0.0/0    trust" | sudo tee -a $hbafile > /dev/null
+            restart=1
+        else
+            echo "$hbafile already configured."
+        fi
+    done
+    if [ $restart = 1 ]
+    then
+        sudo /etc/init.d/postgresql restart
+    fi
+}
+
+defaults_remote_database() {
+    defaults_database
+}
+
+wizard_remote_database() {
+    echo
+    echo "Remote PostgreSQL server configuration"
+    echo "^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^"
+    echo
+    echo "We will use PostgreSQL to store application state"
+    echo "(apart from files that are just files in your filesystem)"
+    echo
+
+    _read_input "Please enter the server name/IP: " LAVA_DB_SERVER $LAVA_DB_SERVER
+    _read_input "Please enter the database name: " LAVA_DB_NAME $LAVA_DB_NAME
+    _read_input "Please enter the database user: " LAVA_DB_USER $LAVA_DB_USER
+    _read_input "Please enter the database port (empty is OK): " LAVA_DB_PORT 5432
+    _read_input "Please enter the database password: " LAVA_DB_PASSWORD $LAVA_DB_PASSWORD
+}
+
+install_remote_database()
+{
+    logger "Creating database configuration for LAVA instance $LAVA_INSTANCE"
+
+    # Create database configuration file
+    cat >$LAVA_PREFIX/$LAVA_INSTANCE/etc/lava-server/default_database.conf <<DEFAULT_DATABASE_CONF
+dbuser='$LAVA_DB_USER'
+dbpass='$LAVA_DB_PASSWORD'
+basepath=''
+dbname='$LAVA_DB_NAME'
+dbserver='$LAVA_DB_SERVER'
+dbport='$LAVA_DB_PORT'
+dbtype='pgsql'
+DEFAULT_DATABASE_CONF
+}
+
+defaults_web_hosting() {
+    if test -z "$LAVA_APACHE_VHOST"; then
+        export LAVA_APACHE_VHOST=$(hostname --fqdn)
+    fi
+}
+
+wizard_web_hosting() {
+    echo
+    echo "Apache and uWSGI configuration"
+    echo "^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^"
+    echo
+    echo "We will use Apache 2 to serve static application files"
+    echo "Apache will also use mod uWSGI to talk to the application"
+    echo "servers running LAVA code"
+    echo
+
+    echo "Please enter the hostname where you want your LAVA server"
+    echo "web interface to be accessible. This will the determine the"
+    echo "name of the Apache virtualhost used for LAVA, and the hostname"
+    echo "users will use to access the LAVA web interface."
+    echo
+    _read_input "Hostname[$LAVA_APACHE_VHOST]: " LAVA_APACHE_VHOST "$LAVA_APACHE_VHOST"
+
+    case "$RESPONSE" in
+        next)
+            return 0  # loop complete
+    esac
+    return 1  # another loop please
+}
+
+generate_conf_d_file(){
+    # Create apache2 instance configuration for single IP machine
+    mkdir -p $LAVA_PREFIX/$LAVA_INSTANCE/etc/apache2/conf.d/
+    cat >$LAVA_PREFIX/$LAVA_INSTANCE/etc/apache2/conf.d/${LAVA_INSTANCE}.conf <<INSTANCE_FOR_SINGLE_IP
+
+# set the static files directory for this instance
+Alias  /${LAVA_INSTANCE}-static/ $LAVA_PREFIX/$LAVA_INSTANCE/var/www/lava-server/static/
+
+# Allow serving media, static and other custom files
+<Directory $LAVA_PREFIX/$LAVA_INSTANCE/var/www>
+    Options FollowSymLinks
+    AllowOverride None
+    Order allow,deny
+    allow from all
+</Directory>
+
+# uWSGI mount point. For this to work the uWSGI module needs be loaded.
+# XXX: Perhaps we should just load it ourselves here, dunno.
+<Location /${LAVA_INSTANCE}>
+    SetHandler              uwsgi-handler
+    uWSGISocket             $LAVA_PREFIX/$LAVA_INSTANCE/run/uwsgi.sock
+</Location>
+
+INSTANCE_FOR_SINGLE_IP
+}
+
+
+install_web_hosting() {
+    logger "Installing uWSGI and other hosting parts for LAVA instance $LAVA_INSTANCE"
+
+    # Create apache2 site
+    cat >$LAVA_PREFIX/$LAVA_INSTANCE/etc/apache2/sites-available/lava-server.conf <<INSTANCE_SITE
+<VirtualHost *:80>
+    ServerAdmin webmaster@localhost
+    ServerName $LAVA_APACHE_VHOST
+
+    # Allow serving media, static and other custom files
+    <Directory $LAVA_PREFIX/$LAVA_INSTANCE/var/www>
+        Options FollowSymLinks
+        AllowOverride None
+        Order allow,deny
+        allow from all
+    </Directory>
+
+    # This is a small directory with just the index.html file that tells users
+    # about this instance has a link to application pages
+    DocumentRoot        $LAVA_PREFIX/$LAVA_INSTANCE/var/www/lava-server
+
+    # uWSGI mount point. For this to work the uWSGI module needs be loaded.
+    # XXX: Perhaps we should just load it ourselves here, dunno.
+    <Location />
+        SetHandler              uwsgi-handler
+        uWSGISocket             $LAVA_PREFIX/$LAVA_INSTANCE/run/uwsgi.sock
+    </Location>
+
+    # Make exceptions for static and media.
+    # This allows apache to serve those and offload the application server
+    <Location /static>
+        SetHandler      none
+    </Location>
+    # We don't need media files as those are private in our implementation
+
+    # images folder for lava-dispatcher tarballs
+    <Location /images>
+        SetHandler      none
+    </Location>
+
+
+</VirtualHost>
+INSTANCE_SITE
+
+    sudo ln -s $LAVA_PREFIX/$LAVA_INSTANCE/etc/apache2/sites-available/lava-server.conf /etc/apache2/sites-available/$LAVA_INSTANCE.conf
+
+    generate_conf_d_file
+
+    # Create reload file
+    echo "Touching this file will gracefully restart uWSGI worker for LAVA instance: $LAVA_INSTANCE" > $LAVA_PREFIX/$LAVA_INSTANCE/etc/lava-server/uwsgi.reload
+
+    # Create uWSGI configuration file
+    cat >$LAVA_PREFIX/$LAVA_INSTANCE/etc/lava-server/uwsgi.ini <<UWSGI_INI
+[uwsgi]
+home = $LAVA_PREFIX/$LAVA_INSTANCE/var/lib/bootstrap-venv
+socket = $LAVA_PREFIX/$LAVA_INSTANCE/run/uwsgi.sock
+chmod-socket = 660
+wsgi-file = $LAVA_PREFIX/$LAVA_INSTANCE/bin/lava-server.wsgi
+master = true
+workers = 8
+logto = $LAVA_PREFIX/$LAVA_INSTANCE/var/log/lava-uwsgi.log
+log-master = true
+auto-procname = true
+touch-reload = $LAVA_PREFIX/$LAVA_INSTANCE/etc/lava-server/uwsgi.reload
+gid = $LAVA_SYS_USER
+uid = $LAVA_SYS_USER
+buffer-size = 65535
+UWSGI_INI
+
+    sudo a2ensite $LAVA_INSTANCE.conf
+    if [ "$LAVA_DEV_MODE" = yes ]; then
+        sudo a2dissite 000-default || true
+    fi
+    sudo service apache2 restart
+}
+
+install_docs() {
+    local lava_deployment_tool=$(readlink -f $0 | xargs dirname)
+
+    local base="$LAVA_PREFIX/$LAVA_INSTANCE/var/www/lava-server/static/docs"
+    mkdir -p $base
+    rm -rf $base/*
+
+    local lava_deployment_tool_docs=$base/_src
+    cp -par $lava_deployment_tool/doc $lava_deployment_tool_docs
+
+    # installed components
+    local develop_eggs_dir=$LAVA_PREFIX/$LAVA_INSTANCE/code/current/develop-eggs
+    for egglink in $develop_eggs_dir/*.egg-link; do
+        component=$(basename $egglink | sed -e 's/\.egg-link//')
+        docdir=$(head -n 1 $egglink)/doc
+        if [ -d $docdir ]; then
+            echo "INFO: building documentation for $component from $docdir"
+            if [ $component = "lava-server" ]
+            then
+                ln -sf $docdir/* $lava_deployment_tool_docs/
+            else
+                ln -sfT $docdir $lava_deployment_tool_docs/$component
+            fi
+        fi
+    done
+
+    # components in local development
+    local local_development=$LAVA_PREFIX/$LAVA_INSTANCE/code/current/local
+    for dir in $local_development/*; do
+        component=$(basename $dir)
+        docdir=$dir/doc
+        if [ -d $docdir ]; then
+            echo "INFO: building documentation for $component from $docdir"
+            if [ $component = "lava-server" ]
+            then
+                ln -sf $docdir/* $lava_deployment_tool_docs/
+            else
+                ln -sfT $docdir $lava_deployment_tool_docs/$component
+            fi
+        fi
+    done
+
+    # documentation for lava-deployment-tool itself. Also contains the index.
+    sphinx-build -b html $lava_deployment_tool_docs $base
+}
+
+defaults_app() {
+    true
+}
+
+
+wizard_app() {
+    echo
+    echo "LAVA application configuration"
+    echo "^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^"
+    echo
+    if [ "$LAVA_DEV_MODE" = yes ]; then
+        LAVA_SERVER_DEBUG=true
+        LAVA_BUILDOUT_CFG="${LAVA_BUILDOUT_CFG-buildout-development.cfg}"
+    else
+        LAVA_SERVER_DEBUG=false
+        LAVA_BUILDOUT_CFG="${LAVA_BUILDOUT_CFG-buildout-production.cfg}"
+    fi
+    return 0
+}
+
+_git_describe() {
+    local head="$1"
+    git describe "$head" --tags 2>/dev/null || \
+        git log --max-count=1 --pretty=%ad-%h --date=short "$head" 2>/dev/null
+}
+
+install_app() {
+    echo "Installing/upgrading application code from $LAVA_MANIFEST_REPOSITORY ($LAVA_MANIFEST_HEAD)"
+
+    if [ ! -e $LAVA_PREFIX/$LAVA_INSTANCE/etc/lava-server/settings.conf ]; then
+        echo "Generating $LAVA_PREFIX/$LAVA_INSTANCE/etc/lava-server/settings.conf for PRODUCTION"
+        cat >$LAVA_PREFIX/$LAVA_INSTANCE/etc/lava-server/settings.conf <<SETTINGS_CONF
+{
+    "DEBUG": $LAVA_SERVER_DEBUG,
+    "TEMPLATE_DIRS": [
+        "$LAVA_PREFIX/$LAVA_INSTANCE/etc/lava-server/templates",
+        "$LAVA_PREFIX/$LAVA_INSTANCE/code/current/server_code/templates/"
+    ],
+    "STATICFILES_DIRS": [
+        ["lava-server", "$LAVA_PREFIX/$LAVA_INSTANCE/code/current/server_code/htdocs/"]
+    ],
+    "MEDIA_ROOT": "$LAVA_PREFIX/$LAVA_INSTANCE/var/lib/lava-server/media",
+    "STATIC_ROOT": "$LAVA_PREFIX/$LAVA_INSTANCE/var/www/lava-server/static",
+    "MEDIA_URL": "/media/",
+    "STATIC_URL": "/static/",
+    "MOUNT_POINT": "/",
+    "LOGIN_URL": "/accounts/login/",
+    "LOGIN_REDIRECT_URL": "/",
+    "DATAREPORT_DIRS": [
+        "$LAVA_PREFIX/$LAVA_INSTANCE/etc/lava-server/reports"
+    ],
+    "DATAVIEW_DIRS": [
+        "$LAVA_PREFIX/$LAVA_INSTANCE/etc/lava-server/views"
+    ]
+}
+SETTINGS_CONF
+    fi
+
+    local venv="$LAVA_PREFIX/$LAVA_INSTANCE/var/lib/bootstrap-venv"
+
+    # create or update local cache of the manifest git-repo
+    manifest_cache_name=$(echo "$LAVA_MANIFEST_REPOSITORY" | sed -e 's/[^a-zA-Z0-9]/_/g')
+    manifest_cache="$LAVA_PREFIX/$LAVA_INSTANCE/code/cache-${manifest_cache_name}"
+    if [ -d "$manifest_cache" ]; then
+        echo "Updating $manifest_cache ..."
+        (cd "$manifest_cache" && git pull)
+    else
+        git clone "$LAVA_MANIFEST_REPOSITORY" "$manifest_cache"
+    fi
+
+    # determine version number from $LAVA_MANIFEST_REPOSITORY and
+    # $LAVA_MANIFEST_HEAD
+    #
+    # If there is no viable version number, use YYYY-MM-DD-COMMITHASH
+    local gitrev=$( cd "$manifest_cache" && _git_describe "$LAVA_MANIFEST_HEAD" || _git_describe "origin/$LAVA_MANIFEST_HEAD")
+
+    if [ -z "$gitrev" ]; then
+        echo
+        echo "ERROR: could not determine git revision of lava-manifest"
+        echo "  Repository: $LAVA_MANIFEST_REPOSITORY"
+        echo "        Head: $LAVA_MANIFEST_HEAD"
+        echo
+        exit 1
+    fi
+
+    echo
+    echo "Using manifest from"
+    echo "  Repository: $LAVA_MANIFEST_REPOSITORY"
+    echo "        Head: $LAVA_MANIFEST_HEAD ($gitrev)"
+    echo "      Config: $LAVA_BUILDOUT_CFG"
+    echo
+
+    local code="$LAVA_PREFIX/$LAVA_INSTANCE/code/$gitrev"
+
+    LOCAL_BUILDOUTS=`ls -A  $LAVA_PREFIX/$LAVA_INSTANCE/code/current/local`
+    if [ -n "$LOCAL_BUILDOUTS" -a "$LAVA_DEV_MODE" = yes ]; then
+        echo "WARNING: Developer mode is end of life!"
+        echo "All local buildouts must be removed."
+        echo "Any update of buildouts using the upstream LAVA git repository WILL"
+        echo "break lava-deployment-tool instances!"
+        echo
+        echo "LAVA development now happens via packaging:"
+        echo "https://staging.validation.linaro.org/static/docs/installation.html"
+        echo
+        echo "Aborting upgrade until all local buildouts are removed."
+        echo
+        exit 1
+    fi
+
+    set -ex
+    if [ ! -e ${code} ]; then
+        mkdir ${code}
+        mkdir ${code}/local
+        (cd "$manifest_cache" && git archive "$LAVA_MANIFEST_HEAD" || git archive "origin/$LAVA_MANIFEST_HEAD") | (cd "$code" && tar x)
+        mkdir ${code}/bin
+        [ -d $LAVA_PREFIX/$LAVA_INSTANCE/code/current/local ] && \
+            find $LAVA_PREFIX/$LAVA_INSTANCE/code/current/local \
+            -maxdepth 1 -type l -exec cp -P \{} $code/local/ \;
+        ln -s ${venv}/bin/{uwsgi,buildout} ${code}/bin/
+        _create_buildout_caches
+        ln -s $LAVA_DOWNLOAD_CACHE ${code}/download-cache
+        ln -s $LAVA_GIT_CACHE ${code}/git-cache
+        ln -s $LAVA_EGG_CACHE ${code}/eggs
+    fi
+    # If LAVA_BUILDOUT_CFG does not specify a file in the branch,
+    # symlink it in here before running buildout (as buildout works
+    # relative to the config file).
+    local cfg="$(basename "${LAVA_BUILDOUT_CFG}")"
+    if [ "${cfg}" != "${LAVA_BUILDOUT_CFG}" ]; then
+        ln -sfT "${LAVA_BUILDOUT_CFG}" "${code}/${cfg}"
+    fi
+    pushd $code
+    ${venv}/bin/buildout -n -c "${cfg}"
+    popd
+    set +ex
+
+    gen_lava_dispatcher_config
+
+    ln -sfT $(basename $code) $LAVA_PREFIX/$LAVA_INSTANCE/code/current
+}
+
+
+defaults_config_app() {
+    export LAVA_SCHEDULER_ENABLED=yes
+}
+
+
+wizard_config_app() {
+    _read_input "Enable the scheduler in this instance (yes/no)? [yes] " LAVA_SCHEDULER_ENABLED yes
+
+    _read_input "Do you want to configure the lava-dispatcher (yes/no)? [yes] " LAVA_DISPATCHER_CONFIG yes
+
+    if [ $LAVA_DISPATCHER_CONFIG = yes ]; then
+        config_lava_dispatcher
+    fi
+
+    return 0
+}
+
+
+# this is an awkwardly named variable.
+config_lava_dispatcher() {
+    echo "Lava Dispatcher Configuration"
+    echo "-----------------------------"
+
+    echo "LAVA_SERVER_IP"
+    echo "^^^^^^^^^^^^^^"
+    echo "This is the IP of this host, from which the attached devices"
+    echo "can download the image parts."
+    echo "For a worker instance, this is the IP of this worker."
+    echo ""
+    echo "Here is the list of network device on this host"
+
+    ip addr | awk '{ if ($1 == "inet" && $4 != "host") { gsub("/.*", "", $2); print("  " $2 " " $7) } }'
+
+    if [ -z "$LAVA_SERVER_IP" ]; then
+        # try the IP associated with the default gateway
+        local iface=$(ip route | awk '{ if ($1 == "default") { print($5); exit; } }')
+        LAVA_SERVER_IP=$(ip addr show "$iface" | awk '{ if ($1 == "inet") { gsub("/.*", "", $2); print($2) } }')
+    fi
+
+    while true; do
+
+        _read_input "Please enter the IP address: " LAVA_SERVER_IP
+
+        if test -n "$LAVA_SERVER_IP" && echo "$LAVA_SERVER_IP" | grep -q -E -e '[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}'; then
+            echo "The IP address is '$LAVA_SERVER_IP'"
+            break
+        else
+            echo "$LAVA_SERVER_IP is not a valid IP address."
+            if [ "$LAVA_NON_INTERACTIVE" = "yes" ]; then
+                exit 1
+            fi
+        fi
+    done
+
+    echo
+    echo "LAVA_PROXY"
+    echo "^^^^^^^^^^"
+
+    echo "This is the address and port of cache proxy service, format is like:"
+    echo "http://192.168.1.10:3128/"
+    _read_input "Please enter the URL: " LAVA_PROXY
+
+
+    # Location for rootfs/boot tarballs extracted from images
+    export LAVA_IMAGE_TMPDIR=$LAVA_PREFIX/$LAVA_INSTANCE/var/www/lava-server/images
+
+    # URL where LAVA_IMAGE_TMPDIR can be accessed remotely
+    export LAVA_IMAGE_URL=http://$SERVER_IP/lava-server/images
+
+    # Location on the device for storing test results.
+    export LAVA_RESULT_DIR=$LAVA_PREFIX/$LAVA_INSTANCE/tmp
+
+    # Location for caching downloaded artifacts such as hwpacks and images
+    export LAVA_CACHEDIR=$LAVA_PREFIX/$LAVA_INSTANCE/var/cache/lava-dispatcher
+
+}
+
+gen_lava_dispatcher_config() {
+    LAVA_DISPATCHER_CONFIG_FILE=$LAVA_PREFIX/$LAVA_INSTANCE/etc/lava-dispatcher/lava-dispatcher.conf
+
+    if [ -e "${LAVA_DISPATCHER_CONFIG_FILE}" ]; then
+        echo "Not overwriting lava-dispatcher config file $LAVA_DISPATCHER_CONFIG_FILE"
+        return
+    fi
+
+    echo "Creating lava-dispatcher config file $LAVA_DISPATCHER_CONFIG_FILE"
+    cat >$LAVA_DISPATCHER_CONFIG_FILE <<LAVA_DISPATCHER_CONF
+# This file was automatically generated by lava-deployment-tool
+
+LAVA_SERVER_IP = $LAVA_SERVER_IP
+
+# Location for rootfs/boot tarballs extracted from images
+LAVA_IMAGE_TMPDIR = $LAVA_IMAGE_TMPDIR
+
+# URL where LAVA_IMAGE_TMPDIR can be accessed remotely
+LAVA_IMAGE_URL = http://%(LAVA_SERVER_IP)s/images
+
+# Location on the device for storing test results.
+LAVA_RESULT_DIR = $LAVA_RESULT_DIR
+
+# Location for caching downloaded artifacts such as hwpacks and images
+LAVA_CACHEDIR = $LAVA_CACHEDIR
+
+# This is the address and port of cache proxy service, format is like:
+# LAVA_PROXY = http://192.168.1.10:3128/
+LAVA_PROXY = $LAVA_PROXY
+
+# The url point to the version of lava-test to be install with pip
+#LAVA_TEST_URL = bzr+http://bazaar.launchpad.net/~le-chi-thu/lava-test/enabled-file-cache/#egg=lava-test
+
+# Python logging level to use
+# # 10 = DEBUG
+# # 20 = INFO
+# # 30 = WARNING
+# # 40 = ERROR
+# # Messages with a lower number than LOGGING_LEVEL will be suppressed
+# LOGGING_LEVEL = 10
+
+LAVA_DISPATCHER_CONF
+
+}
+
+install_config_app() {
+    # Enable virtualenv
+    . $LAVA_PREFIX/$LAVA_INSTANCE/bin/activate
+
+    if [ "${LAVA_SCHEDULER_ENABLED-x}" = "x" ]; then
+        # LAVA_SCHEDULER_ENABLED was not in the config.
+        # Set it to 'yes' as that was the assumed behaviour before
+        # LAVA_SCHEDULER_ENABLED was introduced.
+        echo "Setting LAVA_SCHEDULER_ENABLED to 'yes'..."
+        export LAVA_SCHEDULER_ENABLED='yes'
+        _save_config
+    fi
+
+    if [ "$LAVA_INSTALL_STEPS" = "$LAVA_WORKER_STEPS" ] ; then
+        echo "Remote worker install skipping database migrations and static files"
+        echo "Restarting instance so changes can be picked up..."
+        set -x
+        sudo restart lava-instance LAVA_INSTANCE=$LAVA_INSTANCE || true # in case of upgrades
+        set +x
+    else
+        echo "Building cache of static files..."
+        set -x
+        rm -rf $LAVA_PREFIX/$LAVA_INSTANCE/var/www/lava-server/static
+        if lava-server manage | grep -q build_static; then
+            collectstatic_cmd=build_static
+        else
+            collectstatic_cmd="collectstatic -v0"
+        fi
+        lava-server manage \
+            $collectstatic_cmd --noinput --link || die "Failed to update the cache of static content"
+        set +x
+
+        echo "Stopping instance for database changes..."
+        set -x
+        sudo stop lava-instance LAVA_INSTANCE=$LAVA_INSTANCE || true # in case of upgrades
+        set +x
+
+        echo "Synchronizing database..."
+        set -x
+        lava-server manage \
+            syncdb --noinput || die "Failed to synchronize database (run non-migration db updates)"
+        set +x
+
+        echo "Running migrations..."
+        set -x
+        lava-server manage \
+            migrate --noinput || die "Failed to run database migrations"
+        set +x
+
+        echo "Starting instance again..."
+        set -x
+        sudo start lava-instance LAVA_INSTANCE=$LAVA_INSTANCE
+        set +x
+    fi
+    # Get out of virtualenv
+    deactivate
+}
+
+gen_lava_worker_config() {
+    # put the worker conf file in place
+    LAVA_WORKER_CONFIG_FILE=$LAVA_PREFIX/$LAVA_INSTANCE/etc/lava-server/worker.conf
+
+    if [ -e "${LAVA_WORKER_CONFIG_FILE}" ]; then
+        if grep "LAVA_WORKER_CONFIG_VERSION='${REQUIRED_LAVA_WORKER_CONFIG_VERSION}'" $LAVA_WORKER_CONFIG_FILE > /dev/null
+            then
+            echo "Not overwriting worker config file $LAVA_WORKER_CONFIG_FILE"
+            return
+        fi
+    fi
+
+    echo "Creating worker config file $LAVA_WORKER_CONFIG_FILE"
+
+    cat >$LAVA_WORKER_CONFIG_FILE <<LAVA_WORKER_CONFIG
+# This file was automatically generated by lava-deployment-tool
+# Config version
+LAVA_WORKER_CONFIG_VERSION='0'
+# Worker heartbeat timeout - frequency for heartbeat updates
+HEARTBEAT_TIMEOUT='300'
+# Master server RPC2 URL
+RPC2_URL=''
+
+LAVA_WORKER_CONFIG
+
+}
+
+install_worker_config () {
+    gen_lava_worker_config
+}
+
+wizard_worker_config () {
+    true
+}
+
+defaults_worker_config () {
+    true
+}
+
+
+check_min_version() {
+    SETUP_VER=0
+    if [ -e $LAVA_PREFIX/.setup ]; then
+        SETUP_VER=$(cat $LAVA_PREFIX/.setup)
+    fi
+
+    if [ $SETUP_VER -lt $LAVA_SETUP_REQUIRED_VERSION ]; then
+        echo "There are new dependencies that need to be installed before upgrading LAVA."
+        if [ "$LAVA_INSTALL_STEPS" = "$LAVA_WORKER_STEPS" ]; then
+            die "Please run '$0 setupworker' first"
+        else
+            die "Please run '$0 setup' first"
+        fi
+    fi
+}
+
+ensure_downloaded_check_sha256 () {
+    local url="$1"
+    local sha256="$2"
+    local filename="$(basename "$url")"
+    if [ ! -f "$filename" ]; then
+        wget "$url"
+    fi
+    echo "$sha256  $filename" | sha256sum -c || die "checksum mismatch on $filename"
+}
+
+_create_buildout_caches() {
+    echo "Creating buildout caches"
+    sudo mkdir -p $LAVA_EGG_CACHE
+    sudo chown $(whoami):$(id -gn) $LAVA_EGG_CACHE
+    sudo mkdir -p $LAVA_DOWNLOAD_CACHE/dist
+    sudo chown -R $(whoami):$(id -gn) $LAVA_DOWNLOAD_CACHE
+    sudo mkdir -p $LAVA_GIT_CACHE
+    sudo chown $(whoami):$(id -gn) $LAVA_GIT_CACHE
+}
+
+cmd_setup() {
+    SETUP_VER=0
+    if [ -e $LAVA_PREFIX/.setup ]; then
+        SETUP_VER=$(cat $LAVA_PREFIX/.setup)
+    fi
+
+
+    if [ $SETUP_VER -lt $LAVA_SETUP_REQUIRED_VERSION ]; then
+        echo "===================="
+        echo "LAVA Deployment Tool"
+        echo "===================="
+        echo
+        echo "System preparation steps:"
+        echo " 1) Installing $LAVA_PKG_LIST"
+        echo " 2) Setting up $LAVA_PREFIX owned by you"
+        echo " 3) Setting up the egg and download cache for buildbot"
+        echo " 4) Setting up upstart jobs (incuding removal of stale jobs)"
+        echo
+        _read_input "Type YES to continue, anything else to abort: " RESPONSE YES
+        test "$RESPONSE" = 'YES' || return
+
+        set -xe
+
+        echo "Add Linaro tools ppa"
+        sudo apt-get update
+        sudo apt-get install --yes python-software-properties
+        sudo add-apt-repository --yes ppa:linaro-maintainers/tools
+        sudo apt-get update
+
+        echo "Installing english language pack, if needed"
+        # XXX: I'm not 100% sure this is needed
+        sudo apt-get install --yes language-pack-en
+
+        # Use English locale, this is VERY important for PostgreSQL locale settings
+        # XXX: I don't like en_US.UTF-8, is there any POSIX.UTF-8 we could use?
+        echo "Installing essential packages, if needed"
+        LANG=en_US.UTF-8 sudo apt-get install --yes $LAVA_PKG_LIST
+
+        echo "Creating LAVA filesystem in $LAVA_PREFIX"
+        sudo mkdir -p $LAVA_PREFIX
+        echo "Making $(whoami) the owner of that location"
+        sudo chown $(whoami):$(id -gn) $LAVA_ROOT
+        sudo chown $(whoami):$(id -gn) $LAVA_PREFIX
+
+        _create_buildout_caches
+        pushd $LAVA_DOWNLOAD_CACHE/dist
+        ensure_downloaded_check_sha256 \
+            http://pypi.python.org/packages/source/d/distribute/distribute-0.6.24.tar.gz \
+            c61fde9f388c9600eb8ee54bd7168039c5fb74fa334138bc49cdf6a6c1341627
+        ensure_downloaded_check_sha256 \
+            https://launchpad.net/bzr/2.5/2.5.1/+download/bzr-2.5.1.tar.gz \
+            967346fa6cc52971a8dfd5171ec22e1928cf455fb4317013b05b0915ff927982
+        ensure_downloaded_check_sha256 \
+            http://projects.unbit.it/downloads/uwsgi-$LAVA_UWSGI.tar.gz \
+            $LAVA_UWSGI_SHA256
+        ensure_downloaded_check_sha256 \
+            http://pypi.python.org/packages/source/z/zc.buildout/zc.buildout-1.5.2.tar.gz \
+            0ac5a325d3ffbc5a988fb3ba87f4159d4769cc73e3331cb5234edc8839b6506b
+        ensure_downloaded_check_sha256 \
+            http://pypi.python.org/packages/source/v/versiontools/versiontools-1.9.1.tar.gz \
+            a969332887a18a9c98b0df0ea4d4ca75972f24ca94f06fb87d591377e83414f6
+        popd
+
+        set +x
+        echo "Creating upstart script for: lava"
+        sudo sh -c "cat >/etc/init/lava.conf" <<LAVA_CONF
+author "Zygmunt Krynicki"
+description "LAVA (abstract task)"
+
+start on runlevel [2345]
+stop on runlevel [06]
+
+post-start script
+    logger "Started LAVA (all instances)"
+end script
+
+post-stop script
+    logger "Stopped LAVA (all instances)"
+end script
+LAVA_CONF
+
+        echo "Creating upstart script for: lava-instances"
+        sudo sh -c "cat >/etc/init/lava-instances.conf" <<LAVA_CONF
+author "Zygmunt Krynicki"
+description "LAVA (instances)"
+
+start on starting lava
+
+task
+
+script
+    for dir in \`ls /srv/lava/instances\`; do
+        LAVA_INSTANCE=\`basename \$dir\`
+# TODO: Check if the instance should start automatically on boot
+        if [ -e $LAVA_PREFIX/\$LAVA_INSTANCE/etc/lava-server/instance.conf ]; then
+            start lava-instance LAVA_INSTANCE=\$LAVA_INSTANCE
+        fi
+    done
+end script
+LAVA_CONF
+
+        sudo rm -f "/etc/init/lava-uwsgi-workers.conf"
+
+        echo "Creating upstart script for: lava-instance"
+        sudo sh -c "cat >/etc/init/lava-instance.conf" <<LAVA_CONF
+author "Zygmunt Krynicki"
+description "LAVA (instance)"
+
+# Stop when lava is being stopped
+stop on stopping lava
+
+# Use LAVA_INSTANCE to differentiate instances
+instance \$LAVA_INSTANCE
+
+# Export the instance name so that we can use it in other
+# related LAVA jobs.
+export LAVA_INSTANCE
+
+pre-start script
+    # Don't start unless the instance configuration file is present
+    if [ ! -e $LAVA_PREFIX/\$LAVA_INSTANCE/etc/lava-server/instance.conf ]; then
+        stop
+    else
+        logger "LAVA instance (\$LAVA_INSTANCE) starting..."
+    fi
+end script
+
+post-start script
+    logger "LAVA instance (\$LAVA_INSTANCE) started"
+end script
+
+pre-stop script
+    logger "LAVA instance (\$LAVA_INSTANCE) stopping..."
+end script
+
+post-stop script
+    logger "LAVA instance (\$LAVA_INSTANCE) stopped"
+end script
+LAVA_CONF
+
+        sudo rm -f /etc/init/lava-uwsgi-instance.conf
+
+        echo "Creating upstart script for: lava-instance-uwsgi"
+        sudo sh -c "cat >/etc/init/lava-instance-uwsgi.conf" <<LAVA_CONF
+author "Zygmunt Krynicki"
+description "LAVA uWSGI worker"
+
+# This is an instance job, there are many possible workers
+# each with different instance variable.
+instance \$LAVA_INSTANCE
+
+# Stop and start along with the rest of the instance
+start on starting lava-instance
+stop on stopping lava-instance LAVA_INSTANCE=\$LAVA_INSTANCE
+# TODO: make uwsgi compatible with upstart socket activation
+# start on socket PROTO=unix PATH=$LAVA_PREFIX/\$LAVA_INSTANCE/run/uwsgi.sock
+
+# We want each worker to respawn if it gets hurt.
+respawn
+
+# Announce activity
+pre-start script
+    # Don't start unless the instance configuration file is present
+    if [ ! -e $LAVA_PREFIX/\$LAVA_INSTANCE/etc/lava-server/instance.conf ]; then
+        stop
+    else
+        # Announce uWSGI becoming online
+        logger "LAVA instance (\$LAVA_INSTANCE) uWSGI starting..."
+    fi
+end script
+
+post-start script
+    logger "LAVA instance (\$LAVA_INSTANCE) uWSGI started"
+end script
+
+pre-stop script
+    logger "LAVA instance (\$LAVA_INSTANCE) uWSGI stopping..."
+end script
+
+post-stop script
+    logger "LAVA instance (\$LAVA_INSTANCE) uWSGI stopped"
+end script
+
+# uWSGI wants to be killed with SIGQUIT to indicate shutdown
+# NOTE: this is not supported on Lucid (upstart is too old)
+# Currently no workaround exists
+kill signal SIGQUIT
+
+# Run uWSGI with instance specific configuration file
+script
+    # Load instance settings
+    . $LAVA_PREFIX/\$LAVA_INSTANCE/etc/lava-server/instance.conf
+    # Simluate virtualenv without spawing anything
+    export VIRTUAL_ENV=$LAVA_PREFIX/\$LAVA_INSTANCE
+    export PATH=\$VIRTUAL_ENV/bin:\$PATH
+    # Start uwsgi, no forks, no daemons, gid/uid changing is managed by uwsgi
+    exec $LAVA_PREFIX/\$LAVA_INSTANCE/bin/uwsgi --ini=$LAVA_PREFIX/\$LAVA_INSTANCE/etc/lava-server/uwsgi.ini
+end script
+LAVA_CONF
+
+        echo "Creating upstart script for: lava-instance-scheduler"
+        sudo sh -c "cat >/etc/init/lava-instance-scheduler.conf" <<LAVA_CONF
+author "Zygmunt Krynicki"
+description "LAVA Scheduler"
+
+# This is an instance job, there are many possible workers
+# each with different instance variable.
+instance \$LAVA_INSTANCE
+
+# Stop and start along with the rest of the instance
+start on starting lava-instance
+stop on stopping lava-instance LAVA_INSTANCE=\$LAVA_INSTANCE
+
+# Respawn the worker if it got hurt
+respawn
+
+# Announce workers becoming online
+pre-start script
+    # Don't start unless the instance configuration file is present
+    if [ ! -e $LAVA_PREFIX/\$LAVA_INSTANCE/etc/lava-server/instance.conf ]; then
+        stop
+    else
+        . $LAVA_PREFIX/\$LAVA_INSTANCE/etc/lava-server/instance.conf
+        # We only prevent the scheduler from running if
+        # LAVA_SCHEDULER_ENABLED is set and set to 'no', to be most
+        # compatible with the previous behaviour of always running the
+        # scheduler.
+        if [ "x\$LAVA_SCHEDULER_ENABLED" = "xno" ]; then
+            stop
+        else
+            logger "LAVA instance (\$LAVA_INSTANCE) scheduler starting..."
+        fi
+    fi
+end script
+
+post-start script
+    logger "LAVA instance (\$LAVA_INSTANCE) scheduler started"
+end script
+
+pre-stop script
+    logger "LAVA instance (\$LAVA_INSTANCE) scheduler stopping..."
+end script
+
+post-stop script
+    logger "LAVA instance (\$LAVA_INSTANCE) scheduler stopped"
+end script
+
+script
+    # Load instance settings
+    . $LAVA_PREFIX/\$LAVA_INSTANCE/etc/lava-server/instance.conf
+    # Simluate virtualenv without spawing anything
+    export VIRTUAL_ENV=$LAVA_PREFIX/\$LAVA_INSTANCE
+    export PATH=\$VIRTUAL_ENV/bin:\$PATH
+    # Start LAVA scheduler, it runs as root in this release
+    if [ -f $LAVA_PREFIX/\$LAVA_INSTANCE/sbin/mount-masterfs ] ; then
+        if ! $LAVA_PREFIX/\$LAVA_INSTANCE/sbin/mount-masterfs ; then
+            logger "LAVA instance (\$LAVA_INSTANCE) failed to mount master filesystem"
+            exit 1
+        fi
+    fi
+    exec $LAVA_PREFIX/\$LAVA_INSTANCE/bin/lava-server manage --instance-template=$LAVA_PREFIX/{instance}/etc/lava-server/{{filename}}.conf --instance=\$LAVA_INSTANCE scheduler --logfile=$LAVA_PREFIX/\$LAVA_INSTANCE/var/log/lava-scheduler.log --loglevel=info
+end script
+LAVA_CONF
+
+        if [ \! -e /etc/apache2/mods-available/uwsgi.load ]; then
+            echo "Building uWSGI apache module..."
+            _tmpdir="$(mktemp -d)"
+
+            trap "rm -rf \"${_tmpdir}\"" EXIT
+            set -x
+            pushd $_tmpdir
+            tar -xzf $LAVA_DOWNLOAD_CACHE/dist/uwsgi-$LAVA_UWSGI.tar.gz --strip-components=1
+            cd apache2
+            apxs2 -c mod_uwsgi.c
+            sudo apxs2 -i -a mod_uwsgi.la
+            popd
+            set +x
+        fi
+
+        # Store setup version
+        echo $LAVA_SETUP_REQUIRED_VERSION > $LAVA_PREFIX/.setup
+        echo "Setup complete, you can now install LAVA"
+    else
+        echo "This step has been already performed"
+    fi
+}
+
+
+die() {
+    echo "$1"
+    exit 1
+}
+
+
+_banner() {
+    echo "===================="
+    echo "LAVA Deployment Tool"
+    echo "===================="
+    echo
+}
+
+
+cmd_install() {
+    export LAVA_INSTANCE=$1
+
+    check_min_version
+    _banner
+
+    if [ -z "$LAVA_INSTANCE" ]; then
+        echo "You need to pass the name of the instance to create as first argument"
+        return
+    fi
+
+    # Sanity checking, ensure that instance does not exist yet
+    if [ -d "$LAVA_PREFIX/$LAVA_INSTANCE" ]; then
+        echo "Instance $LAVA_INSTANCE already exists"
+        return
+    fi
+
+    # Configure everything first (get all the answers)
+    _configure "$LAVA_INSTANCE"
+    # Roll the installation
+    _install
+}
+
+
+cmd_upgrade() {
+    export LAVA_INSTANCE=$1
+
+    check_min_version
+    _banner
+
+    if [ -z "$LAVA_INSTANCE" ]; then
+        echo "You need to pass the name of the instance to create as first argument"
+        return
+    fi
+
+    # If user specified LAVA_BUILDOUT_CFG, save it from overwriting by
+    # loaded config
+    NEW_LAVA_BUILDOUT_CFG="$LAVA_BUILDOUT_CFG"
+    _load_configuration "$LAVA_INSTANCE"
+
+    # Sanity checking, ensure that instance exist
+    if [ \! -d "$LAVA_PREFIX/$LAVA_INSTANCE" ]; then
+        echo "Instance $LAVA_INSTANCE does not exist"
+        return
+    fi
+
+    # If user specified non-empty LAVA_BUILDOUT_CFG to upgrade to,
+    # use that in the following process
+    if [ -n "$NEW_LAVA_BUILDOUT_CFG" ]; then
+        LAVA_BUILDOUT_CFG="$NEW_LAVA_BUILDOUT_CFG"
+    fi
+
+    _maybe_pre_convert_to_buildout
+    install_app
+    _maybe_post_convert_to_buildout
+    for upgrade_step in $LAVA_INSTALL_STEPS; do
+        upgrade_$upgrade_step
+    done
+}
+
+
+_maybe_pre_convert_to_buildout () {
+    if [ -e $LAVA_PREFIX/$LAVA_INSTANCE/code ]; then
+        return
+    fi
+    if [ ! -e $LAVA_PREFIX/$LAVA_INSTANCE/lib ]; then
+        echo "Instance appears to be neither pip based or buildout based."
+        echo "Cowardly refusing to proceed."
+        exit 1;
+    fi
+
+    echo "$LAVA_INSTANCE appears to be a pip based instance"
+    echo "This script can attempt to convert it, but this may "
+    echo "lose any custom packages you have installed unless you "
+    echo "already have a plan to cope with that."
+    echo
+    _read_input "Proceed? (y/n) " RESPONSE
+
+    if [ "$RESPONSE" != 'y' ]; then
+        exit 1;
+    fi
+
+    set -xe
+    LAVA_BUILDOUT_CFG="${LAVA_BUILDOUT_CFG-buildout.cfg}"
+    _save_config
+    install_buildout
+    mkdir -p $LAVA_PREFIX/$LAVA_INSTANCE/code
+    set +xe
+}
+
+
+_maybe_post_convert_to_buildout () {
+    local instpath=$LAVA_PREFIX/$LAVA_INSTANCE
+    set -xe
+    if [ ! -e $instpath/lib ]; then
+        return
+    fi
+    $instpath/bin/pip freeze > $instpath/last-pip-installed-versions.txt
+    rm -rf $instpath/{bin,lib,src,build,local}
+    rm $instpath/etc/lava-server/lava-server.wsgi
+    ln -s $instpath/code/current/bin $instpath
+    sed -i -e 's%lib/python2\../site-packages/lava_server%code/current/server_code%' \
+        $instpath/etc/lava-server/settings.conf
+    sed -i -e "s%home = $instpath%&/var/lib/bootstrap-venv%" \
+        -e "s%$instpath/etc/lava-server/lava-server\.wsgi%$instpath/bin/lava-server.wsgi%" \
+        $instpath/etc/lava-server/uwsgi.ini
+    set +xe
+}
+
+
+cmd_remove() {
+    LAVA_INSTANCE=${1:-dev}
+
+    local destroy=""
+    if [ "$LAVA_NON_INTERACTIVE" = yes ]; then
+        if [ "$LAVA_FORCE" = no ]; then
+            echo
+            echo "For safety reasons we do not allow removing an instance"
+            echo "in non-interactive mode. Try again without -n/--non-interactive"
+            echo "(or use --force)"
+            exit 1
+        else
+            destroy="DESTROY"
+        fi
+    fi
+
+    _banner
+
+    # Sanity checking, ensure that instance exists
+    if [ \! -d "$LAVA_PREFIX/$LAVA_INSTANCE" ]; then
+        echo "Instance $LAVA_INSTANCE does not exist"
+        return
+    fi
+
+    _load_configuration "$LAVA_INSTANCE"
+
+    echo "*** WARNING ***"
+    echo "You are about to IRREVERSIBLY DESTROY the instance $LAVA_INSTANCE"
+    echo "There is no automatic backup, there is no way to undo this step"
+    echo "*** WARNING ***"
+
+    if [ ${LAVA_INSTANCE_OWNS_USER} = "yes" ]; then
+        echo "We will remove system user $LAVA_SYS_USER"
+    fi
+    if [ "$LAVA_INSTALL_STEPS" != "$LAVA_WORKER_STEPS" ] ; then
+        echo "We will remove PostgreSQL database $LAVA_DB_NAME"
+        echo "We will remove PostgreSQL user: $LAVA_DB_USER"
+    fi
+    echo "We will remove everything in $LAVA_PREFIX/$LAVA_INSTANCE"
+    echo "We will remove the apache site $LAVA_INSTANCE.conf"
+    echo
+    _read_input "Type DESTROY to continue: " RESPONSE "$destroy"
+    if test "$RESPONSE" != 'DESTROY'; then
+        echo "Instance removal aborted."
+        exit 1
+    fi
+
+    logger "Removing LAVA instance $LAVA_INSTANCE"
+
+    set -e
+    set -x
+    # Remove everything
+    sudo stop lava-instance LAVA_INSTANCE=$LAVA_INSTANCE || true
+    sudo rm -f "/etc/apache2/sites-available/$LAVA_INSTANCE.conf" || true
+    sudo rm -f "/etc/apache2/sites-enabled/$LAVA_INSTANCE.conf" || true
+    sudo rm -f "/etc/apache2/conf.d/$LAVA_INSTANCE.conf" || true
+    if [ "$LAVA_INSTALL_STEPS" != "$LAVA_WORKER_STEPS" ] ; then
+        sudo -u postgres dropdb "$LAVA_DB_NAME" || true
+        sudo -u postgres dropuser "$LAVA_DB_USER" || true
+    else
+        set +e
+        umount $LAVA_PREFIX/$LAVA_INSTANCE/var/lib/lava-server/media
+        set -e
+    fi
+    if [ ${LAVA_INSTANCE_OWNS_USER} = "yes" ]; then
+        sudo userdel "$LAVA_SYS_USER" || true
+    fi
+    sudo rm -rf "$LAVA_PREFIX/$LAVA_INSTANCE" || true
+    set +x
+    set +e
+}
+
+
+_find_snapshot () {
+    LAVA_INSTANCE=${1}
+
+    check_min_version
+    set -e
+
+    # Sanity checking, ensure that instance exists
+    if [ \! -d "$LAVA_PREFIX/$LAVA_INSTANCE" ]; then
+        echo "Instance $LAVA_INSTANCE does not exist"
+        return
+    fi
+
+    local SNAPSHOT_ID=${2}
+    local SNAPSHOT_PATH="$LAVA_ROOT/backups/$LAVA_INSTANCE/$SNAPSHOT_ID"
+    local SNAPSHOT_PATH_ALT="$LAVA_ROOT/backups/$SNAPSHOT_ID"
+
+    if [ -e "$SNAPSHOT_PATH" ]; then
+        echo "$SNAPSHOT_PATH"
+    else
+        if [ -e "$SNAPSHOT_PATH_ALT" ]; then
+            echo "$SNAPSHOT_PATH_ALT"
+        else
+            echo "Cannot find snapshot called '$SNAPSHOT_ID'"
+            echo "It should be in $SNAPSHOT_PATH or $SNAPSHOT_PATH_ALT (alternative)"
+            exit 1
+        fi
+    fi
+}
+
+_restore_db_from_dump () {
+
+    # Load database configuration
+    . $LAVA_PREFIX/$LAVA_INSTANCE/etc/lava-server/default_database.conf
+
+    # Substitute missing defaults for IP-based connection this works around a bug
+    # in postgresql configuration on default Ubuntu installs and allows us to use
+    # the ~/.pgpass file.
+    test -z "$dbport" && dbport=5432
+    test -z "$dbserver" && dbserver=localhost
+
+    if [ "$dbserver" != "localhost" ]; then
+        echo "You can only run restore on the host on which postgres is running"
+        return
+    fi
+
+    set -x
+
+    sudo -u postgres dropdb \
+        --port $dbport \
+        $dbname || true
+    sudo -u postgres createdb \
+        --encoding=UTF-8 \
+        --locale=en_US.UTF-8 \
+        --template=template0 \
+        --owner=$dbuser \
+        --port $dbport \
+        --no-password \
+        $dbname
+    sudo -u postgres createlang \
+        --port $dbport \
+        plpgsql \
+        $dbname || true
+    sudo -u postgres pg_restore \
+        --exit-on-error --no-owner \
+        --port $dbport \
+        --role $dbuser \
+        --dbname $dbname \
+        "${1}" > /dev/null
+}
+
+cmd_restore-db () {
+    set -e
+    LAVA_INSTANCE=${1}
+    local SNAPSHOT_ID=${2}
+
+    if [ -z "$LAVA_INSTANCE" -o -z "$SNAPSHOT_ID" ]; then
+        echo "Usage: lava-deployment-tool restore-db INSTANCE SNAPSHOT_ID"
+        exit 1
+    fi
+
+    SNAPSHOT="$(_find_snapshot $LAVA_INSTANCE $SNAPSHOT_ID)"
+
+    _load_configuration "$LAVA_INSTANCE"
+
+    db_snapshot="$SNAPSHOT/database.dump"
+
+    if [ \! -f "$db_snapshot" ]; then
+        echo "$SNAPSHOT does not contain a db snapshot"
+        exit 1
+    fi
+
+    if [ status lava-instance LAVA_INSTANCE=$LAVA_INSTANCE > /dev/null 2>&1 ]; then
+        echo "LAVA instance $LAVA_INSTANCE appears to be running"
+        exit 1
+    fi
+
+    echo "Are you sure you want to restore the database of $LAVA_INSTANCE from"
+    echo "$SNAPSHOT_ID?  This will DESTROY the existing database of $LAVA_INSTANCE"
+    echo
+    _read_input "Type RESTORE to continue: " RESPONSE
+    test "$RESPONSE" = 'RESTORE' || return
+
+    _restore_db_from_dump "$db_snapshot"
+
+    echo "Done"
+
+}
+
+cmd_restore() {
+    set -e
+    LAVA_INSTANCE=${1}
+    local SNAPSHOT_ID=${2}
+
+    if [ -z "$LAVA_INSTANCE" -o -z "$SNAPSHOT_ID" ]; then
+        echo "Usage: lava-deployment-tool restore INSTANCE SNAPSHOT_ID"
+        exit 1
+    fi
+
+    SNAPSHOT="$(_find_snapshot $LAVA_INSTANCE $SNAPSHOT_ID)"
+
+    _load_configuration "$LAVA_INSTANCE"
+
+    db_snapshot="$SNAPSHOT/database.dump"
+    files_snapshot="$SNAPSHOT/files.tar.gz"
+
+    if [ \! -f "$db_snapshot" -o \! -f "$files_snapshot" ]; then
+        echo "$SNAPSHOT does not look like a complete snapshot"
+        return
+    fi
+
+    echo "Are you sure you want to restore instance $LAVA_INSTANCE from"
+    echo "$SNAPSHOT_ID?  This will DESTROY the existing state of $LAVA_INSTANCE"
+    echo
+    _read_input "Type RESTORE to continue: " RESPONSE
+    test "$RESPONSE" = 'RESTORE' || return
+
+    _restore_db_from_dump "$db_snapshot"
+
+    sudo rm -rf $LAVA_PREFIX/$LAVA_INSTANCE/var/lib/lava-server/
+    mkdir -p $LAVA_PREFIX/$LAVA_INSTANCE/var/lib/lava-server/
+    tar \
+        --extract \
+        --gzip \
+        --directory $LAVA_PREFIX/$LAVA_INSTANCE/var/lib/lava-server/ \
+        --file "$files_snapshot"
+
+    # Allow instance to write to media directory
+    sudo chgrp -R $LAVA_SYS_USER $LAVA_PREFIX/$LAVA_INSTANCE/var/lib/lava-server/
+    sudo chmod -R g+rwXs $LAVA_PREFIX/$LAVA_INSTANCE/var/lib/lava-server/
+
+    echo "Done"
+}
+
+
+cmd_backup() {
+    LAVA_INSTANCE=${1:-dev}
+
+    check_min_version
+    set -e
+
+    # Sanity checking, ensure that instance exists
+    if [ \! -d "$LAVA_PREFIX/$LAVA_INSTANCE" ]; then
+        echo "Instance $LAVA_INSTANCE does not exist"
+        return
+    fi
+
+    # Load database configuration
+    . $LAVA_PREFIX/$LAVA_INSTANCE/etc/lava-server/default_database.conf
+
+    # Substitute missing defaults for IP-based connection this works around a bug
+    # in postgresql configuration on default Ubuntu installs and allows us to use
+    # the ~/.pgpass file.
+    test -z "$dbserver" && dbserver=localhost
+    test -z "$dbport" && dbport=5432
+
+    export PGPASSWORD=$dbpass
+
+    snapshot_id=$(TZ=UTC date +%Y-%m-%dT%H-%M-%SZ)
+
+    echo "Making backup with id: $snapshot_id"
+
+    destdir="$LAVA_ROOT/backups/$LAVA_INSTANCE/$snapshot_id"
+
+    mkdir -p "$destdir"
+
+    set -x
+
+    echo "Creating database snapshot..."
+
+    pg_dump \
+        --no-owner \
+        --format=custom \
+        --host=$dbserver \
+        --port=$dbport \
+        --username=$dbuser \
+        --no-password $dbname \
+        --schema=public \
+        > "$destdir/database.dump"
+
+    echo "Backing up instance configuration..."
+    tar --create \
+        --gzip \
+        --directory $LAVA_PREFIX/$LAVA_INSTANCE/ \
+        --file "$destdir/etc.tar.gz" \
+        etc
+
+    echo "Creating file repository snapshot..."
+    # tar exiting with code 1 means that the files changed under us as
+    # tar was running.  As this is to be expected, we suppress that
+    # exit code.  Exit code 2 means something bad happened, and we
+    # should stop.
+    GZIP='--rsyncable' tar \
+        --create \
+        --ignore-failed-read \
+        --warning=no-file-changed \
+        --gzip \
+        --directory $LAVA_PREFIX/$LAVA_INSTANCE/var/lib/lava-server/ \
+        --file "$destdir/files.tar.gz" \
+        . || [ $? == 1 ]
+    #   ^ There is a DOT HERE don't remove it
+
+    ln -sfT "$destdir" "$LAVA_ROOT/backups/$LAVA_INSTANCE/latest"
+
+    echo "Done"
+}
+
+
+cmd_manage() {
+    LAVA_INSTANCE=${1:-dev}
+    test -n '$1' && shift
+
+    # Sanity checking, ensure that instance exists
+    if [ \! -d "$LAVA_PREFIX/$LAVA_INSTANCE" ]; then
+        echo "Instance $LAVA_INSTANCE does not exist"
+        return
+    fi
+    _load_configuration "$LAVA_INSTANCE"
+
+    # Enable virtualenv
+    . $LAVA_PREFIX/$LAVA_INSTANCE/bin/activate
+
+    set -x
+    lava-server manage \
+        "$@"
+    set +x
+}
+
+
+is_vhost(){
+    export LAVA_INSTANCE=$1
+    vhost_conf="/etc/apache2/sites-enabled/$LAVA_INSTANCE.conf"
+    singleip_conf="/etc/apache2/conf.d/${LAVA_INSTANCE}.conf"
+    if [ -f ${vhost_conf} ]; then
+        echo 'vhost'
+    elif [ -f ${singleip_conf} ]; then
+        echo 'location'
+    else
+        echo 'unknown'
+    fi
+}
+
+
+cmd_list(){
+
+    _banner
+
+    INSTANCES=`ls $LAVA_PREFIX`
+    if [ "X${INSTANCES}" = "X" ]; then
+        echo "NO INSTANCES"
+        return
+    else
+        echo "================================"
+        echo "INSTANCE_NAME     VHOST/LOCATION"
+        echo "================================"
+    fi
+    for instance in ${INSTANCES}; do
+        is_vhost_value=`is_vhost ${instance}`
+        printf "%s\t%s\n" ${instance} ${is_vhost_value}
+    done
+    echo "================================"
+}
+
+
+toggle_instance() {
+    export LAVA_INSTANCE=$1
+    export TARGET=${2:vhost}
+
+    if [ -z "$LAVA_INSTANCE" ]; then
+        echo "You need to pass the name of the instance to create as first argument"
+        return
+    fi
+
+    # Sanity checking, ensure that instance exist
+    if [ \! -d "$LAVA_PREFIX/$LAVA_INSTANCE" ]; then
+        echo "Instance $LAVA_INSTANCE does not exist"
+        return
+    fi
+
+    settings_file="$LAVA_PREFIX/$LAVA_INSTANCE/etc/lava-server/settings.conf"
+    single_conf="$LAVA_PREFIX/$LAVA_INSTANCE/etc/apache2/conf.d/${LAVA_INSTANCE}.conf"
+    reload_file="$LAVA_PREFIX/$LAVA_INSTANCE/etc/lava-server/uwsgi.reload"
+
+    if [ "x${TARGET}" = "xvhost" ]; then
+        sudo rm /etc/apache2/conf.d/${LAVA_INSTANCE}.conf
+        sed -i "s/    \"MEDIA_URL\": \"\/${LAVA_INSTANCE}-media\/\",/    \"MEDIA_URL\": \"\/media\/\",/" ${settings_file}
+        sed -i "s/    \"STATIC_URL\": \"\/${LAVA_INSTANCE}-static\/\",/    \"STATIC_URL\": \"\/static\/\",/" ${settings_file}
+        sed -i "s/    \"LOGIN_URL\": \"\/${LAVA_INSTANCE}\/accounts\/login\/\",/    \"LOGIN_URL\": \"\/accounts\/login\/\",/" ${settings_file}
+        sed -i "s/    \"LOGIN_REDIRECT_URL\": \"\/${LAVA_INSTANCE}\",/    \"LOGIN_REDIRECT_URL\": \"\/\",/" ${settings_file}
+        touch ${reload_file}
+        sudo a2ensite $LAVA_INSTANCE.conf
+        if [ -e /etc/apache2/sites-enabled/000-default -a "$LAVA_DEV_MODE" = yes ]; then
+            sudo a2dissite 000-default || true
+        fi
+        return 0
+    elif [ "x${TARGET}" = "xlocation" ]; then
+        if [ \! -e "${single_conf}" ];then
+            generate_conf_d_file
+        fi
+
+        sudo a2dissite $LAVA_INSTANCE.conf
+        if [ "`ls -A /etc/apache2/sites-enabled/`" = "" -a "$LAVA_DEV_MODE" = yes ]; then
+            sudo a2ensite 000-default
+        fi
+
+        sudo ln -s ${single_conf} /etc/apache2/conf.d/${LAVA_INSTANCE}.conf
+        sed -i "s/    \"MEDIA_URL\": \"\/media\/\",/    \"MEDIA_URL\": \"\/${LAVA_INSTANCE}-media\/\"\,/" ${settings_file}
+        sed -i "s/    \"STATIC_URL\": \"\/static\/\",/    \"STATIC_URL\": \"\/${LAVA_INSTANCE}-static\/\",/" ${settings_file}
+        sed -i "s/    \"LOGIN_URL\": \"\/accounts\/login\/\",/    \"LOGIN_URL\": \"\/${LAVA_INSTANCE}\/accounts\/login\/\",/" ${settings_file}
+        sed -i "s/    \"LOGIN_REDIRECT_URL\": \"\/\",/    \"LOGIN_REDIRECT_URL\": \"\/${LAVA_INSTANCE}\",/" ${settings_file}
+        touch ${reload_file}
+        return 0
+    else
+        echo 'target must be specified with "vhost" or "location"'
+        return 1
+    fi
+}
+
+
+cmd_toggle(){
+    LAVA_INSTANCE=$1
+    TARGET=${2:vhost}
+    _banner
+
+    toggle_instance ${LAVA_INSTANCE} ${TARGET}
+    if [ $? -eq 0 ]; then
+        sudo service apache2 restart
+    fi
+}
+
+
+cmd_toggle_all(){
+    TARGET=${1:vhost}
+
+    _banner
+
+    if [ "X${TARGET}" != "Xvhost"  -a  "X${TARGET}" != "Xlocation" ]; then
+        echo 'Please specify the target with "vhost" or "location"'
+        return 1
+    fi
+
+    INSTANCES=`ls $LAVA_PREFIX`
+    if [ "X${INSTANCES}" = "X" ]; then
+        return
+    fi
+    need_restart_apache=false
+    for instance in ${INSTANCES}; do
+        is_vhost_value=`is_vhost ${instance}`
+        if [ "X${TARGET}" = "X${is_vhost_value}" ]; then
+            continue
+        fi
+        if [ "X${TARGET}" = "Xunknown" ]; then
+            continue
+        fi
+        printf "Start to change instance(%s) to %s\n" ${instance} ${TARGET}
+        toggle_instance ${instance} ${TARGET}
+        if [ $? -eq 0 ]; then
+            need_restart_apache=true
+            printf "Change instance(%s) to %s successfully\n" ${instance} ${TARGET}
+        else
+            printf "Change instance(%s) to %s failed\n" ${instance} ${TARGET}
+        fi
+    done
+    if ${need_restart_apache}; then
+        sudo service apache2 restart
+    fi
+}
+
+usage() {
+    cat <<END_OF_USAGE
+Usage: ${__FILE_NAME__} <command> [options]
+
+Key commands:
+    setup   - prepare machine for LAVA (prerequisites)
+              (do this once before trying out others)
+Commands for working with instances:
+    list    - list all instances installed
+    bundle  - create a bundle in preparation for installing
+              or updating
+    install - install LAVA instance
+    upgrade - upgrade LAVA instance
+    remove  - remove LAVA instance (undoes install)
+    setupworker - update the setup of a remote worker node
+    installworker - install a remote worker node
+    upgradeworker - upgrade remote worker node
+    removeworker - remove remote worker node
+    toggle  - toggle one LAVA instance between being
+            - referenced by the location (aka
+              insance name) or by the vhost
+              * vhost site: the instance is configured with
+                  VirtualHost directive of apache
+                  (ex. http://vhost.example.com)
+              * location site: the instance is configured
+                  with Location directive of apache
+                  (ex. http://localhost/instance_name)
+            - With the location site we can deploy multiple
+            - instances on a single IP machine, while with
+            - the vhost site we need have multiple hostnames
+            - or IPs for deploying multiple instances
+            - run ${__FILE_NAME__} toggle \$instance [location|vhost]
+    toggle_all  - toggle all LAVA instances one time between
+            - used as location site or used as vhost site
+            - like toggle command
+            - run ${__FILE_NAME__} toggle_all [location|vhost]
+Commands for working with data:
+    backup  - backup your data
+    restore - restore earlier backup (removes current data)
+Commands for working at lower level:
+    manage  - run lava-server management commands
+    rebuild-doc - rebuilds the documentation (mostly useful for
+                  developers or people writing documentation)
+
+Options:
+
+-d, --developer-mode
+  Sets developer mode. During installation of an instance,
+  if developer mode is turned the instance will be configured
+  to be run with the Django DEBUG setting turned on
+
+-n, --non-interactive
+  Runs non-interactively. Default answers for all questions
+  will be assumed.
+
+-f, --force
+  Forces potentially destructive actions to be performed, even in
+  non-interactive mode.
+
+Environment variables:
+
+SKIP_ROOT_CHECK=yes      - allow root to run lava-deployment-tool
+LAVA_DB_ALLOWREMOTE=yes  - allow remote access to the postgres database
+                            to setup or migrate a master to support
+                            remote workers.
+
+See the README file for instructions
+END_OF_USAGE
+}
+
+
+main() {
+    os_check
+    uid_check
+    if [ $LAVA_SUPPORTED = 0 ]; then
+        echo "LAVA is not supported on this system"
+        echo "------------------------------------"
+        echo "Please report a bug on lava-deployment-tool"
+        echo "https://bugs.launchpad.net/lava-deployment-tool/+filebug"
+        echo
+        echo "Please provide the following information"
+        echo
+        lsb_release -a
+        exit 1
+    fi
+
+    if [ -n "$1" ]; then
+        cmd="$1"
+        shift
+    else
+        cmd=help
+    fi
+
+    #  For manage command, short-circuit and pass all options as-is.
+    if [ $cmd == "manage" ]; then
+        cmd_manage "$@"
+        exit
+    fi
+
+    options="
+        -o ndf
+        --long non-interactive
+        --long developer-mode
+        --long force
+    "
+    TEMP="$(getopt --name ${__FILE_NAME__} $options -- "$@")"
+    getopt_status=$?
+    if [ $getopt_status -ne 0 ]; then
+        exit $getopt_status
+    fi
+    eval set -- "$TEMP"
+
+    while :; do
+        arg="$1"
+        shift
+        case "$arg" in
+            --non-interactive|-n)
+                LAVA_NON_INTERACTIVE=yes
+                ;;
+            --developer-mode|-d)
+                LAVA_DEV_MODE=yes
+                ;;
+            --force|-f)
+                LAVA_FORCE=yes
+                ;;
+            --)
+                break;;
+        esac
+    done
+
+    local lock_name="$cmd"
+    local instance="$1"
+    if [ -n "$instance" ]; then
+        lock_name="${instance}"
+    fi
+    (
+        if flock -n 9; then
+            run_cmd "$cmd" "$@"
+        else
+            echo "Another instance of ${__FILE_NAME__} is already running"
+            exit 1
+        fi
+    ) 9> /var/lock/lava-deployment-tool-${lock_name}.lock
+}
+
+
+run_cmd() {
+    local cmd="$1"
+    shift
+    case "$cmd" in
+        ^$|help)
+            usage
+            ;;
+        setup)
+            cmd_setup "$@"
+            ;;
+        install|upgrade|remove|preview)
+            cmd_$cmd "$@" # 2>&1 | tee "$cmd-log-for-instance-$LAVA_INSTANCE.log"
+            ;;
+        installworker|upgradeworker|removeworker|setupworker)
+            export LAVA_INSTALL_STEPS=$LAVA_WORKER_STEPS
+            os_check
+            cmd_${cmd/worker/} "$@"
+            ;;
+        rebuild-doc)
+            if [ $# -ne 1 ]; then
+                echo "usage: lava-deployment-tool rebuild-doc INSTANCE"
+                exit 1
+            fi
+            LAVA_INSTANCE="$1"
+            install_docs
+            ;;
+        backup)
+            cmd_backup "$@"
+            ;;
+        restore*)
+            cmd_$cmd "$@"
+            ;;
+        install_*)
+            set -x
+            set -e
+            _load_configuration "$@"
+            $cmd
+            set +x
+            set +e
+            ;;
+        bundle)
+            cmd_bundle "$@"
+            ;;
+        toggle)
+            cmd_toggle "$@"
+            ;;
+        toggle_all)
+            cmd_toggle_all "$@"
+            ;;
+        list)
+            cmd_list "$@"
+            ;;
+        upgrade_*)
+            set -x
+            set -e
+            _load_configuration "$@"
+            $cmd
+            set +x
+            set +e
+            ;;
+        version)
+            echo "LAVA Deployment Tool, version $LAVA_DEPLOYMENT_TOOL_VERSION."
+            ;;
+        *)
+            echo "Unknown command: $cmd, try help"
+            exit 1
+            ;;
+    esac
+}
+
+__FILE_NAME__=`basename ${0}`
+main "$@"

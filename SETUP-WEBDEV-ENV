@@ -1,0 +1,102 @@
+Setup LAVA Web Application Development Environment
+==================================================
+
+Setup Steps
+^^^^^^^^^^^
+
+Prepare a requirements file that doesn't include the LAVA webapp which you want
+to develop in. e.g. if you want to develop lava-scheduler, make a
+requirements-dev.txt as follow:
+
+lava-server
+lava-dashboard
+
+Then follow the steps:
+
+$ ./lava-deployment-tool setup
+$ ./lava-deployment-tool bundle requirements-dev.txt
+$ ./lava-development-tool install dev lava.pybundle
+$ ./lava-development-tool manage dev createsuperuser
+
+Toggle developer mode during the installation.
+
+Checkout lava-scheduler source code in /srv/lava/instances/dev/src:
+
+$ cd /srv/lava/instances/dev/src
+$ bzr branch lp:lava-scheduler
+
+After adding a component, run the following command to ensure the component is
+integrated with the rest of the application:
+
+$ ./lava-deployment-tool install_config_app dev
+
+Activate virtualenv:
+
+$ . /srv/lava/instances/dev/bin/activate
+
+Setup develop environment in webapp:
+
+$ cd /srv/lava/instances/dev/src/lava-scheduler
+$ ./setup.py develop
+
+Setup and sync the database:
+$ ./lava-deployment-tool manage dev syncdb
+$ ./lava-deployment-tool manage dev migrate
+
+Touch the uwsgi.reload to restart the uwsgi, you can find the log by
+'tail -F dev/var/log/lava-uwsgi.log' in another console:
+
+$ touch etc/lava-server/uwsgi.reload
+
+If uwsgi fails to reload, try to start it again:
+
+$ sudo start lava-instance-uwsgi LAVA_INSTANCE=env
+
+On Ubuntu 10.10 (Maverick), comment the following line in 
+/etc/init/lava-server-uwsgi.conf:
+
+# kill signal xxx
+
+Now you can browse the lava-server from http://<Your IP>/
+
+When you do some changes to lava-scheduler webapp code, reload related webapp
+to load the changes:
+
+$ touch etc/lava-server/uwsgi.reload
+
+If it doesn't take effect, try:
+
+$ sudo restart lava-instance-scheduler LAVA_INSTANCE=dev
+
+Notes
+^^^^^
+
+* Don't run 'setup.py develop' without activating the virtualenv from the
+  instance.
+
+* Editing templates does not require restarting uwsgi.
+
+* You may want to enable debug mode in
+  /srv/lava/instances/dev/etc/lava-server/lava-server.conf
+
+* If you change code, touch the uwsgi file
+
+* If you want to change scheduler code (not the web parts) you'll have to
+  restart lava-instance-scheduler:
+
+$ sudo restart lava-instance-scheduler LAVA_INSTANCE=dev
+
+* If you have more than one instance installed on the machine, there are two
+  ways to make it browsable from http://<IP>/
+
+  a) disable other sites
+
+$ cd /etc/apache2/sites-enabled
+$ ls
+lab.conf dev.conf
+$ sudo a2dissite lab.conf
+$ sudo restart apache2
+
+  b) allow multiple sites together
+
+TODO
