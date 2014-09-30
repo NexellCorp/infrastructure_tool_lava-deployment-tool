@@ -1081,6 +1081,9 @@ install_remote_database()
 {
     logger "Creating database configuration for LAVA instance $LAVA_INSTANCE"
 
+    # psw0523 add
+    defaults_remote_database
+
     # Create database configuration file
     cat >$LAVA_PREFIX/$LAVA_INSTANCE/etc/lava-server/default_database.conf <<DEFAULT_DATABASE_CONF
 dbuser='$LAVA_DB_USER'
