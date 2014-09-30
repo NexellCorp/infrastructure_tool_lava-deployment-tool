@@ -686,8 +686,14 @@ install_fs() {
 }
 
 defaults_remote_fs() {
-    export LAVA_REMOTE_FS_DIR=/srv/lava/instances/${LAVA_INSTANCE}
-    export LAVA_REMOTE_FS_USER=${LAVA_SYS_USER}
+    if [[ ! -z $LAVA_REMOTE_FS_DIR ]]
+    then
+        export LAVA_REMOTE_FS_DIR=/srv/lava/instances/${LAVA_INSTANCE}
+    fi
+    if [[ ! -z $LAVA_REMOTE_FS_USER ]]
+    then
+        export LAVA_REMOTE_FS_USER=${LAVA_SYS_USER}
+    fi
     export LAVA_REMOTE_FS_HOST=${LAVA_MASTER}
 }
 
@@ -898,8 +904,14 @@ install_buildout () {
 }
 
 defaults_database() {
-    export LAVA_DB_NAME="lava-$LAVA_INSTANCE"
-    export LAVA_DB_USER="lava-$LAVA_INSTANCE"
+    if [[ ! -z $LAVA_DB_NAME ]]
+    then
+        export LAVA_DB_NAME="lava-$LAVA_INSTANCE"
+    fi
+    if [[ ! -z $LAVA_DB_USER ]]
+    then
+        export LAVA_DB_USER="lava-$LAVA_INSTANCE"
+    fi
     export LAVA_DB_PORT=""
     if [[ ! -z $LAVA_DB_PASSWORD ]]
     then
