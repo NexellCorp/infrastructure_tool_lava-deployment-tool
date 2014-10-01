@@ -904,16 +904,27 @@ install_buildout () {
 }
 
 defaults_database() {
-    if [[ ! -z $LAVA_DB_NAME ]]
-    then
-        LAVA_DB_NAME="lava-$LAVA_INSTANCE"
-    fi
-    export LAVA_DB_NAME
-    if [[ ! -z $LAVA_DB_USER ]]
-    then
-        LAVA_DB_USER="lava-$LAVA_INSTANCE"
-    fi
-    export LAVA_DB_USER
+    #if [[ ! -z $LAVA_DB_NAME ]]
+    #then
+        #LAVA_DB_NAME="lava-$LAVA_INSTANCE"
+    #fi
+    #export LAVA_DB_NAME
+    #if [[ ! -z $LAVA_DB_USER ]]
+    #then
+        #LAVA_DB_USER="lava-$LAVA_INSTANCE"
+    #fi
+    #export LAVA_DB_USER
+    #export LAVA_DB_PORT=""
+    #if [[ ! -z $LAVA_DB_PASSWORD ]]
+    #then
+      #export LAVA_DB_PASSWORD
+      #LAVA_DB_CUSTOMPWD=yes
+    #else
+      #export LAVA_DB_PASSWORD=$(dd if=/dev/urandom bs=1 count=128 2>/dev/null | md5sum | cut -d ' ' -f 1)
+    #fi
+
+    export LAVA_DB_NAME="lava-$LAVA_INSTANCE"
+    export LAVA_DB_USER="lava-$LAVA_INSTANCE"
     export LAVA_DB_PORT=""
     if [[ ! -z $LAVA_DB_PASSWORD ]]
     then
