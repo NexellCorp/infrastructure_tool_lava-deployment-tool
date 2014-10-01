@@ -906,12 +906,14 @@ install_buildout () {
 defaults_database() {
     if [[ ! -z $LAVA_DB_NAME ]]
     then
-        export LAVA_DB_NAME="lava-$LAVA_INSTANCE"
+        LAVA_DB_NAME="lava-$LAVA_INSTANCE"
     fi
+    export LAVA_DB_NAME
     if [[ ! -z $LAVA_DB_USER ]]
     then
-        export LAVA_DB_USER="lava-$LAVA_INSTANCE"
+        LAVA_DB_USER="lava-$LAVA_INSTANCE"
     fi
+    export LAVA_DB_USER
     export LAVA_DB_PORT=""
     if [[ ! -z $LAVA_DB_PASSWORD ]]
     then
